@@ -33,8 +33,14 @@ IST = ZoneInfo("Asia/Kolkata")
 # 0.5s (2 Hz) → sub-second 500ms buckets, latest price ≤0.5s stale, safe load on
 # the public Groww/MC feed. Override with LIVE_SAMPLE_INTERVAL_S.
 SAMPLE_INTERVAL_S = max(0.1, float(os.environ.get("LIVE_SAMPLE_INTERVAL_S", "0.5")))
-SAMPLE_MAXLEN = 12000       # ~100 min of 0.5s samples per symbol
+# Ring depth per symbol = a FULL trading session so same-day 1s/10s is NEVER cut
+# (6h15m @0.5s ≈ 45k samples ≈ ~7 MB/symbol). DATA-COMPLETENESS is the rule; RAM
+# is managed by SCOPE not by dropping data — the recorder is opt-in and you size
+# the watchlist to the host (RAM ≈ SAMPLE_MAXLEN*~150 B*watchlist). The durable
+# store holds past days. Override LIVE_SAMPLE_MAXLEN only to fit a tiny host.
+SAMPLE_MAXLEN = int(os.environ.get("LIVE_SAMPLE_MAXLEN", "46000"))
 IDLE_TTL_S = 120            # stop a recorder after 2 min with no reads
+STORE_FLUSH_INTERVAL_S = float(os.environ.get("STORE_FLUSH_INTERVAL_S", "30"))  # 1s-candle → DB flush
 
 
 class LiveCandleEngine:
@@ -93,6 +99,7 @@ class LiveCandleEngine:
     async def _record_loop(self, symbol: str, exchange: str, key: str) -> None:
         from .market_data import market_data_service
         log.info("live_candle_recorder_start", symbol=symbol, exchange=exchange)
+        last_flush = time.time()
         try:
             while True:
                 if time.time() - self._last_read.get(key, 0) > IDLE_TTL_S:
@@ -105,8 +112,23 @@ class LiveCandleEngine:
                         self.record(symbol, exchange, tick.ltp, tick.volume)
                 except Exception as e:  # noqa: BLE001
                     log.debug("live_candle_sample_failed", symbol=symbol, error=str(e))
+                # Periodically persist 1s candles so PAST days survive a restart /
+                # the idle stop. No-op when no durable DB is connected.
+                if time.time() - last_flush >= STORE_FLUSH_INTERVAL_S:
+                    last_flush = time.time()
+                    try:
+                        from .intraday_store import flush_live_to_store
+                        await flush_live_to_store(symbol, exchange)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("live_candle_flush_failed", symbol=symbol, error=str(e))
                 await asyncio.sleep(SAMPLE_INTERVAL_S)
         finally:
+            # Final flush on stop so the tail of the session is durable.
+            try:
+                from .intraday_store import flush_live_to_store
+                await flush_live_to_store(symbol, exchange)
+            except Exception:  # noqa: BLE001
+                pass
             self._tasks.pop(key, None)
             log.info("live_candle_recorder_stop", symbol=symbol, exchange=exchange)
 

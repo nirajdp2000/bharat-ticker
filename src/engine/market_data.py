@@ -35,6 +35,32 @@ _YF_INTERVAL = {
     "1d": ("1d", "5y"), "1w": ("1wk", "10y"),
 }
 
+# Index symbols → Yahoo index tickers. Indices have no exchange suffix on Yahoo
+# (".NS"/".BO" would yield an invalid ticker → empty history). Friendly aliases
+# and the literal "^"-ticker both resolve here so consumers can pass either.
+_INDEX_YF = {
+    "^NSEI": "^NSEI", "NSEI": "^NSEI", "NIFTY": "^NSEI", "NIFTY50": "^NSEI",
+    "NIFTY 50": "^NSEI",
+    "^NSEBANK": "^NSEBANK", "NSEBANK": "^NSEBANK", "BANKNIFTY": "^NSEBANK",
+    "NIFTYBANK": "^NSEBANK", "NIFTY BANK": "^NSEBANK",
+    "^CNXIT": "^CNXIT", "NIFTYIT": "^CNXIT", "NIFTY IT": "^CNXIT",
+    "^BSESN": "^BSESN", "SENSEX": "^BSESN",
+}
+
+
+def _yahoo_symbol(symbol: str, exchange: str) -> str:
+    """Resolve a request symbol to its Yahoo ticker.
+
+    Indices map to "^"-tickers with no suffix; symbols that already carry a
+    Yahoo qualifier ("^", ".", "=") pass through; equities get .NS/.BO.
+    """
+    idx = _INDEX_YF.get(symbol)
+    if idx:
+        return idx
+    if symbol.startswith("^") or "." in symbol or "=" in symbol:
+        return symbol
+    return symbol + (".BO" if exchange == "BSE" else ".NS")
+
 
 class MarketDataService:
     """Lazily-initialized shared provider stack for the serving layer."""
@@ -305,8 +331,7 @@ class MarketDataService:
         """Return historical OHLCV candles via Yahoo Finance."""
         symbol = canonical_symbol(symbol)
         yf_interval, default_period = _YF_INTERVAL.get(interval, ("1d", "5y"))
-        suffix = ".BO" if exchange == "BSE" else ".NS"
-        yf_symbol = symbol if "." in symbol else symbol + suffix
+        yf_symbol = _yahoo_symbol(symbol, exchange)
 
         loop = asyncio.get_event_loop()
         try:

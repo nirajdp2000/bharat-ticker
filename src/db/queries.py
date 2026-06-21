@@ -80,6 +80,41 @@ GET_EOD_RANGE = sa.text("""
     ORDER BY date ASC
 """)
 
+INSERT_INTRADAY_CANDLE = sa.text("""
+    INSERT INTO intraday_candles (time, symbol, exchange, open, high, low, close, volume)
+    VALUES (:time, :symbol, :exchange, :open, :high, :low, :close, :volume)
+    ON CONFLICT (symbol, exchange, time) DO UPDATE SET
+        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+        close = EXCLUDED.close, volume = EXCLUDED.volume
+""")
+
+# Roll the 1s base up to any sub-minute bucket on read (1s/10s/…). :bucket_s is
+# the bucket width in seconds. Deliberately PLAIN SQL (epoch-floor + array_agg
+# first/last) — NOT TimescaleDB time_bucket()/first()/last() — so it runs on a
+# vanilla Postgres (e.g. Northflank's managed PG addon) as well as TimescaleDB.
+GET_INTRADAY_CANDLES = sa.text("""
+    SELECT
+        to_timestamp(floor(extract(epoch FROM time) / :bucket_s) * :bucket_s) AS bucket,
+        (array_agg(open  ORDER BY time ASC))[1]  AS open,
+        max(high)                                AS high,
+        min(low)                                 AS low,
+        (array_agg(close ORDER BY time DESC))[1] AS close,
+        sum(volume)                              AS volume
+    FROM intraday_candles
+    WHERE symbol = :symbol AND exchange = :exchange
+      AND time >= :start_time AND time < :end_time
+    GROUP BY bucket
+    ORDER BY bucket ASC
+""")
+
+# Honest "was this symbol/day ever captured?" probe — distinguishes
+# not-captured (no rows) from store-not-connected (handled above the query).
+COUNT_INTRADAY_DAY = sa.text("""
+    SELECT count(*) AS n FROM intraday_candles
+    WHERE symbol = :symbol AND exchange = :exchange
+      AND time >= :start_time AND time < :end_time
+""")
+
 SEARCH_INSTRUMENTS = sa.text("""
     SELECT symbol, name, exchange, series, sector, is_active
     FROM instruments
@@ -182,6 +217,38 @@ class TickerQueries:
             },
         )
         return [dict(row) for row in result.mappings().all()]
+
+    async def upsert_intraday_candles(self, candles: list[dict[str, Any]]) -> None:
+        """Idempotently persist 1-second candle rows (per-session flush)."""
+        if not candles:
+            return
+        await self._session.execute(INSERT_INTRADAY_CANDLE, candles)
+        await self._session.commit()
+
+    async def get_intraday_candles(
+        self, symbol: str, exchange: str, bucket_s: float,
+        start_time: datetime, end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """Sub-minute candles for a past day, rolled up to ``bucket_s`` seconds
+        (1 / 10 / …) — plain-SQL bucketing, portable across vanilla PG + Timescale."""
+        result = await self._session.execute(
+            GET_INTRADAY_CANDLES,
+            {"symbol": symbol, "exchange": exchange, "bucket_s": float(bucket_s),
+             "start_time": start_time, "end_time": end_time},
+        )
+        return [dict(row) for row in result.mappings().all()]
+
+    async def count_intraday(
+        self, symbol: str, exchange: str, start_time: datetime, end_time: datetime,
+    ) -> int:
+        """Row count for a symbol/day window — 0 means never captured."""
+        result = await self._session.execute(
+            COUNT_INTRADAY_DAY,
+            {"symbol": symbol, "exchange": exchange,
+             "start_time": start_time, "end_time": end_time},
+        )
+        row = result.mappings().first()
+        return int(row["n"]) if row else 0
 
     async def search_instruments(
         self, query: str, limit: int = 20

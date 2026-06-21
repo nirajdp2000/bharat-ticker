@@ -20,6 +20,8 @@ class MockProvider(DataProvider):
         self.name = name
         self.tier = tier
         self.exchange = exchange
+        # Instance attrs shadow the class stubs below so tests can drive
+        # .return_value / .side_effect and call assertions.
         self.fetch_quote = AsyncMock()
         self.fetch_bulk = AsyncMock()
         self.health_check = AsyncMock(return_value=True)
@@ -29,6 +31,18 @@ class MockProvider(DataProvider):
 
     async def disconnect(self) -> None:
         self._is_connected = False
+
+    # Concrete class-body stubs so the ABC is instantiable (the abstract
+    # methods fetch_quote/fetch_bulk/health_check are overridden per-instance
+    # by AsyncMock in __init__).
+    async def fetch_quote(self, symbol: str) -> TickData:  # type: ignore[override]
+        ...
+
+    async def fetch_bulk(self, symbols: list[str]) -> list[TickData]:  # type: ignore[override]
+        ...
+
+    async def health_check(self) -> bool:  # type: ignore[override]
+        return True
 
 
 @pytest.mark.asyncio

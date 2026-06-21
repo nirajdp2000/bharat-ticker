@@ -48,7 +48,7 @@ class ResponseMeta(BaseModel):
         "REAL_TIME", "NEAR_REAL_TIME", "DELAYED", "END_OF_DAY", "STALE"
     ] = "REAL_TIME"
     last_refresh: datetime | None = None
-    provider_tier: int = Field(default=1, ge=1, le=3, description="Provider tier (1=best)")
+    provider_tier: int = Field(default=1, ge=0, le=3, description="Provider tier (0=persistent DB, 1=best live)")
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}

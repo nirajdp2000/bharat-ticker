@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -22,7 +23,9 @@ from ...engine import chartink, tickertape
 from ...engine.corp_actions import adjust_for_splits
 from ...engine.fundamentals import fetch_fundamentals
 from ...engine.intraday_builder import INTRADAY_SECONDS, points_to_ohlc
+from ...engine.intraday_store import read_past_intraday
 from ...engine.live_candles import SAMPLE_INTERVAL_S, live_candle_engine
+from ...engine.watchlist_recorder import watchlist_recorder
 from ...engine.macro import fetch_fii_dii, fetch_macro
 from ...engine.market_data import market_data_service
 from ...utils.ist_clock import is_market_open, now_ist
@@ -78,6 +81,14 @@ _INTERVAL_MAP = {
     "30minute": "30m", "30m": "30m", "15minute": "15m", "15m": "15m",
     "5minute": "5m", "5m": "5m", "1minute": "1m", "1m": "1m",
 }
+# Upstream (Yahoo) history depth cap per interval code, in calendar days. Kept
+# 1 day INSIDE Yahoo's hard window (1m≤7d, intraday≤60d) — a start sitting
+# exactly on the boundary is rejected ("must be within the last 60 days").
+# Sub-daily feeds are windowed; daily/weekly are effectively unbounded.
+_INTERVAL_MAX_DAYS = {
+    "1m": 6, "5m": 59, "15m": 59, "30m": 59,
+    "1d": 365 * 10, "1w": 365 * 20,
+}
 # Sub-minute / sub-second intervals → bucket seconds (float). Served by the live
 # tick-sampling engine (NSE/BSE feed, never delayed). Finest meaningful bucket is
 # bounded by the sampler cadence (LIVE_SAMPLE_INTERVAL_S, default 0.5s).
@@ -92,6 +103,99 @@ _SECONDS_INTERVALS = {
 
 # Max concurrent upstream fetches per bulk-quotes request (fan-out bound).
 _BULK_CONCURRENCY = 24
+
+# ── Intraday history cache ───────────────────────────────────────────────────
+# A universe sweep re-pulls the same candles every scan. Split the cost by
+# mutability: settled PAST bars are immutable within a session (long TTL); the
+# live TODAY portion moves (short TTL).
+#
+# CRITICAL: a single 5m entry is ~250KB+ live (2925 bars), so an entry-COUNT cap
+# would let a universe sweep balloon to GBs and OOM-kill a 256-512MB host. The
+# cache is therefore bounded by approximate BYTES (default 64MB total), evicting
+# oldest first — safe on the smallest Northflank/Oracle free tiers regardless of
+# how many symbols are swept. In-process (per worker); a shared Redis layer would
+# generalise it to multi-worker.
+_HIST_TTL_S = float(os.environ.get("SB_HIST_TTL_S", "3600"))     # past bars: 1h
+_TODAY_TTL_S = float(os.environ.get("SB_TODAY_TTL_S", "30"))     # today bars: 30s
+
+
+class _TTLCache:
+    """TTL cache bounded by approximate total memory (candle lists are large)."""
+
+    def __init__(self, ttl_s: float, max_mb: float) -> None:
+        self._ttl = ttl_s
+        self._budget = int(max_mb * 1024 * 1024)
+        self._store: dict[tuple, tuple[float, Any, int]] = {}  # key → (ts, value, bytes)
+        self._bytes = 0
+
+    @staticmethod
+    def _sizeof(value: Any) -> int:
+        # Candle lists dominate. A 7-key candle dict (unique ts string + 6 nums)
+        # is ~450 B live in CPython, so budgetMB ≈ real MB (honest, not optimistic).
+        if isinstance(value, list):
+            return len(value) * 450 + 64
+        return 512
+
+    def get(self, key: tuple) -> Any | None:
+        hit = self._store.get(key)
+        if hit and (time.time() - hit[0]) < self._ttl:
+            return hit[1]
+        if hit:
+            self._evict(key)
+        return None
+
+    def put(self, key: tuple, value: Any) -> None:
+        if key in self._store:
+            self._evict(key)
+        b = self._sizeof(value)
+        self._store[key] = (time.time(), value, b)
+        self._bytes += b
+        while self._bytes > self._budget and len(self._store) > 1:
+            self._evict(min(self._store, key=lambda k: self._store[k][0]))
+
+    def _evict(self, key: tuple) -> None:
+        ent = self._store.pop(key, None)
+        if ent:
+            self._bytes -= ent[2]
+
+    def stats(self) -> dict[str, Any]:
+        return {"entries": len(self._store), "approxMB": round(self._bytes / 1024 / 1024, 1),
+                "budgetMB": round(self._budget / 1024 / 1024, 1), "ttlS": self._ttl}
+
+    def clear(self) -> int:
+        n = len(self._store)
+        self._store.clear()
+        self._bytes = 0
+        return n
+
+
+_HIST_CACHE = _TTLCache(_HIST_TTL_S, float(os.environ.get("SB_HIST_CACHE_MB", "48")))
+_TODAY_CACHE = _TTLCache(_TODAY_TTL_S, float(os.environ.get("SB_TODAY_CACHE_MB", "16")))
+
+
+async def _cached_history(symbol: str, exchange: str, code: str,
+                          start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """Yahoo history with a session-length, memory-bounded cache."""
+    key = (symbol, exchange, code, start.date().isoformat(), end.date().isoformat())
+    cached = _HIST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # limit=None → every bar in the range (no truncation; data-completeness rule).
+    rows = await market_data_service.get_history(
+        symbol, exchange, code, start=start, end=end, limit=None)
+    _HIST_CACHE.put(key, rows)
+    return rows
+
+
+async def _cached_today_bars(symbol: str, exchange: str, bucket: int) -> list[dict[str, Any]]:
+    """Today's scraper bars with a short TTL (they keep forming)."""
+    key = (symbol, exchange, bucket)
+    cached = _TODAY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bars = await _today_session_bars(symbol, exchange, bucket)
+    _TODAY_CACHE.put(key, bars)
+    return bars
 
 
 def _f(v: Any) -> float | None:
@@ -416,10 +520,12 @@ async def sb_intraday(
     symbol: str,
     exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
     interval: str = Query("30minute"),
-    limit: int = Query(400, ge=1, le=2000),
+    limit: int | None = Query(None, ge=1, le=100000, description="Max bars to return; OMIT for ALL data (no truncation)"),
+    date: str | None = Query(None, description="YYYY-MM-DD — past-day sub-minute (1s/10s) pull from the durable store"),
 ):
     """``interval`` options, fastest first:
     - ``1second`` / ``10second`` → live tick aggregation (NSE/BSE relay, sub-second).
+      Pass ``date=YYYY-MM-DD`` (a past day) to pull from the durable 1s store.
     - ``1minute``…``30minute`` → REAL BSE intraday curve (StockReachGraph),
       falling back to Yahoo only if BSE has no data for the symbol.
     """
@@ -429,9 +535,35 @@ async def sb_intraday(
     # Sub-minute → live sampled aggregation (lowest latency)
     if interval in _SECONDS_INTERVALS:
         seconds = _SECONDS_INTERVALS[interval]
+
+        # PAST-DAY pull → durable TimescaleDB store (capture-or-never: only days
+        # the recorder ran + flushed exist; reads stay honest about gaps).
+        today = now_ist().date().isoformat()
+        if date:
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid date (want YYYY-MM-DD): {date}")
+        if date and date < today:
+            res = await read_past_intraday(symbol, exchange, seconds, date)
+            if res is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Durable sub-minute store not connected — past-day 1s/10s "
+                           "needs a TimescaleDB DATABASE_URL. Same-day works without it.")
+            served = res["candles"][-limit:] if limit else res["candles"]
+            return {
+                "symbol": symbol, "exchange": exchange, "interval": interval,
+                "granularitySeconds": seconds, "date": date,
+                "source": "timescaledb_intraday_store",
+                "captured": res["captured"],
+                "dataQuality": "HISTORICAL" if res["captured"] else "NOT_CAPTURED",
+                "count": len(served), "candles": served,
+            }
+
         await live_candle_engine.ensure_recorder(symbol, exchange)
         await live_candle_engine.sample_once(symbol, exchange)
-        candles = live_candle_engine.build(symbol, exchange, seconds, limit=limit)
+        candles = live_candle_engine.build(symbol, exchange, seconds, limit=limit or 10**9)
         st = live_candle_engine.status(symbol, exchange)
         return {
             "symbol": symbol, "exchange": exchange, "interval": interval,
@@ -455,7 +587,9 @@ async def sb_intraday(
     except Exception:  # noqa: BLE001
         tt_points = None
     if tt_points:
-        candles = _latest_session_only(points_to_ohlc(tt_points, seconds, limit=limit + 200))[-limit:]
+        candles = _latest_session_only(points_to_ohlc(tt_points, seconds, limit=(limit + 200) if limit else 10**9))
+        if limit:
+            candles = candles[-limit:]
         if candles:
             return {
                 "symbol": symbol, "exchange": "NSE", "interval": interval,
@@ -468,7 +602,9 @@ async def sb_intraday(
     # SECONDARY: real BSE intraday curve (StockReachGraph).
     points = await market_data_service.get_intraday_series(symbol, "0")
     if points:
-        candles = _latest_session_only(points_to_ohlc(points, seconds, limit=limit + 200))[-limit:]
+        candles = _latest_session_only(points_to_ohlc(points, seconds, limit=(limit + 200) if limit else 10**9))
+        if limit:
+            candles = candles[-limit:]
         if candles:
             return {
                 "symbol": symbol, "exchange": "BSE", "interval": interval,
@@ -484,7 +620,7 @@ async def sb_intraday(
     candles = _norm_candles(rows)
     today = now_ist().date().isoformat()
     today_bars = [c for c in candles if c["timestamp"][:10] == today]
-    served = today_bars if today_bars else candles[-limit:]
+    served = today_bars if today_bars else (candles[-limit:] if limit else candles)
     for c in served:
         c["oi"] = 0
     return {
@@ -515,6 +651,36 @@ async def sb_intervals():
         "stream": {"endpoint": "/sb/stream/{symbol}", "transport": "SSE",
                    "note": "server-push ticks, lowest latency"},
     }
+
+
+@router.get("/recorder", summary="Always-on watchlist recorder status")
+async def sb_recorder_status():
+    """State of the gap-free same-day 1s capture loop (watchlist, ticks, flush)."""
+    return watchlist_recorder.status()
+
+
+@router.post("/recorder", summary="Set + start the watchlist recorder")
+async def sb_recorder_set(symbols: str = Query(..., description="Comma-separated symbols to record")):
+    """Point the always-on recorder at a watchlist and start it (e.g. the
+    scanner's active universe). Persists 1s candles when a durable store is wired."""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        raise HTTPException(status_code=400, detail="No valid symbols provided")
+    watchlist_recorder.set_watchlist(syms)
+    await watchlist_recorder.start()
+    return {"status": "started", **watchlist_recorder.status()}
+
+
+@router.get("/cache", summary="Intraday history cache stats")
+async def sb_cache_stats():
+    """Size (entries + approx MB) + TTLs of the past/today candle caches."""
+    return {"past": _HIST_CACHE.stats(), "today": _TODAY_CACHE.stats()}
+
+
+@router.post("/cache/clear", summary="Clear the intraday history cache")
+async def sb_cache_clear():
+    """Drop all cached candles (e.g. after a corporate action / forced refresh)."""
+    return {"cleared": _HIST_CACHE.clear() + _TODAY_CACHE.clear()}
 
 
 @router.get("/stream/{symbol}", summary="Live tick stream (SSE, minimum latency, no broker)")
@@ -554,6 +720,44 @@ async def sb_stream(
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+async def _today_session_bars(
+    symbol: str, exchange: str, bucket_seconds: int, limit: int = 500
+) -> list[dict[str, Any]]:
+    """TODAY's intraday OHLC bars built from REAL scrapers only (never Yahoo).
+
+    ARMED RULE: the current market day is served exclusively by the live
+    exchange scrapers — Tickertape (NSE) first, BSE StockReachGraph second —
+    aggregated to the requested bucket. Returns [] outside a session or when no
+    real feed is reachable (the caller then has no today bars, never delayed).
+    """
+    today = now_ist().date().isoformat()
+    pts: list[dict[str, Any]] | None = None
+
+    # PRIMARY: real NSE intraday curve (Tickertape).
+    try:
+        tt = await tickertape.fetch_intraday_points(symbol, "1d")
+        if tt:
+            pts = _latest_session_only(tt)
+    except Exception:  # noqa: BLE001
+        pts = None
+    # SECONDARY: real BSE intraday curve (StockReachGraph).
+    if not pts:
+        try:
+            bse = await market_data_service.get_intraday_series(symbol, "0")
+            if bse:
+                pts = _latest_session_only(bse)
+        except Exception:  # noqa: BLE001
+            pts = None
+    if not pts:
+        return []
+
+    # Strict: keep ONLY the current calendar day's points.
+    pts = [p for p in pts if str(p.get("timestamp", ""))[:10] == today]
+    if not pts:
+        return []
+    return points_to_ohlc(pts, bucket_seconds, limit=limit)
+
+
 @router.get("/history/{symbol}", summary="Dated candles (day/30minute, +oi, CA-adjusted)")
 async def sb_history(
     symbol: str,
@@ -562,6 +766,7 @@ async def sb_history(
     from_: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
     to: str | None = Query(None, description="YYYY-MM-DD"),
     adjust: bool = Query(True),
+    stream: bool = Query(False, description="Stream candles as NDJSON (one bar/line) for huge pulls"),
 ):
     symbol = _canon(symbol)
     code = _INTERVAL_MAP.get(interval)
@@ -575,21 +780,63 @@ async def sb_history(
             raise HTTPException(status_code=400, detail=f"Invalid date: {d}")
 
     end_dt = _parse(to) if to else now_ist().replace(tzinfo=None)
-    start_dt = _parse(from_) if from_ else end_dt - timedelta(days=365)
-    rows = await market_data_service.get_history(
-        symbol, exchange, code, start=start_dt, end=end_dt, limit=5000)
+    # Intraday intervals have a bounded history on the upstream feed (Yahoo caps
+    # 1m≈7d, 5m/15m/30m≈60d). Default the lookback to that window — and clamp an
+    # over-long `from` to it — so finer-timeframe requests return bars instead of
+    # an empty set. Daily/weekly keep deep history.
+    max_days = _INTERVAL_MAX_DAYS.get(code, 365 * 10)
+    default_days = min(max_days, 365)
+    start_dt = _parse(from_) if from_ else end_dt - timedelta(days=default_days)
+    floor_dt = end_dt - timedelta(days=max_days)
+    if start_dt < floor_dt:
+        start_dt = floor_dt
+    # Past bars from Yahoo, cached for the session (immutable once settled) so a
+    # universe sweep doesn't re-fetch the same history every scan.
+    rows = await _cached_history(symbol, exchange, code, start_dt, end_dt)
     candles = _norm_candles(rows)
+
+    # ARMED RULE: for intraday timeframes the CURRENT market day is served by the
+    # live exchange scrapers ONLY (never the 15-min-delayed Yahoo feed). Drop any
+    # of today's bars Yahoo returned and replace them with the real scraper-built
+    # session (Tickertape → BSE), cached ~30s. Past days stay on Yahoo (genuine).
+    today = now_ist().date().isoformat()
+    today_source = None
+    if code in INTRADAY_SECONDS:
+        candles = [c for c in candles if c["timestamp"][:10] < today]
+        if start_dt.date().isoformat() <= today <= end_dt.date().isoformat():
+            tbars = await _cached_today_bars(symbol, exchange, INTRADAY_SECONDS[code])
+            if tbars:
+                candles += tbars
+                today_source = "scraper_live"
+
     events: list[dict[str, Any]] = []
     if adjust and code in ("1d", "1w"):
         candles, events = adjust_for_splits(candles)
     for c in candles:
         c.setdefault("oi", 0)
-    return {
+
+    meta = {
         "symbol": symbol, "exchange": exchange, "interval": code,
         "from": start_dt.date().isoformat(), "to": end_dt.date().isoformat(),
         "count": len(candles), "adjusted": bool(events), "splitEvents": events,
-        "candles": candles,
+        "pastSource": "yahoo", "todaySource": today_source,
     }
+
+    # NDJSON streaming: a header line, then one candle per line. Emits incrementally
+    # so an arbitrarily large pull never materialises one giant JSON blob in RAM and
+    # the client gets first bytes immediately. Combined with GZip this delivers ALL
+    # bars cheaply. Non-stream path returns the usual single JSON object.
+    if stream:
+        import orjson
+
+        def gen():
+            yield orjson.dumps({"meta": meta}) + b"\n"
+            for cdl in candles:
+                yield orjson.dumps(cdl) + b"\n"
+
+        return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+    return {**meta, "candles": candles}
 
 
 # ── Fundamentals ───────────────────────────────────────────────────────────────

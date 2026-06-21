@@ -18,8 +18,11 @@ def client() -> TestClient:
 
 
 def test_root_endpoint(client):
-    """Verify that root endpoint returns system metadata."""
-    response = client.get("/")
+    """Verify that the API metadata endpoint returns system metadata.
+
+    Root ``/`` now serves the HTML dashboard; JSON metadata lives at ``/api``.
+    """
+    response = client.get("/api")
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "Bharat Ticker"
@@ -80,7 +83,8 @@ def test_get_quote_realtime(client, mock_redis, monkeypatch):
     res_data = response.json()
     assert res_data["status"] == "success"
     assert res_data["data"]["info"]["symbol"] == "RELIANCE"
-    assert res_data["data"]["price"]["ltp"] == 2945.5
+    # Prices are serialized as Decimal strings to preserve precision.
+    assert float(res_data["data"]["price"]["ltp"]) == 2945.5
     assert res_data["meta"]["source"] == "nse_scraper"
 
 
@@ -112,5 +116,6 @@ def test_get_quote_eod_fallback(client, mock_redis, mock_db, monkeypatch):
     res_data = response.json()
     assert res_data["status"] == "success"
     assert res_data["data"]["info"]["symbol"] == "RELIANCE"
-    assert res_data["data"]["price"]["close"] == 2935.25
+    # Prices are serialized as Decimal strings to preserve precision.
+    assert float(res_data["data"]["price"]["close"]) == 2935.25
     assert res_data["meta"]["source"] == "timescaledb"

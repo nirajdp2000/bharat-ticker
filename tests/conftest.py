@@ -143,6 +143,9 @@ def mock_db(monkeypatch):
     monkeypatch.setattr(DatabaseManager, "disconnect", mock_disconnect)
     monkeypatch.setattr(DatabaseManager, "get_session", lambda self: mock_session)
     monkeypatch.setattr(DatabaseManager, "health_check", lambda self: asyncio.sleep(0.01) or True)
+    # Report "connected" so the EOD path reads the (mocked) DB instead of
+    # falling through to a real live network fetch — keeps tests hermetic.
+    monkeypatch.setattr(DatabaseManager, "is_connected", property(lambda self: True))
 
     return mock_session
 

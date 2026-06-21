@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, ORJSONResponse
 
 from .api.endpoints.historical import router as historical_router
@@ -53,12 +54,20 @@ async def lifespan(app: FastAPI):
     from .engine.market_data import market_data_service
     asyncio.create_task(market_data_service.warm())
 
+    # Always-on watchlist recorder — gap-free same-day 1s capture + durable flush.
+    # Dormant unless WATCHLIST env is set (no surprise upstream load otherwise).
+    from .engine.watchlist_recorder import watchlist_recorder
+    if watchlist_recorder.enabled:
+        await watchlist_recorder.start()
+
     log.info("bharat_ticker_ready", port=settings.api_port)
 
     yield  # Application is running
 
     # Shutdown: clean up connections
     log.info("bharat_ticker_shutting_down")
+    from .engine.watchlist_recorder import watchlist_recorder
+    await watchlist_recorder.stop()
     await redis_manager.disconnect()
     await db_manager.disconnect()
     log.info("bharat_ticker_stopped")
@@ -114,6 +123,11 @@ log.info("cors_configured", origins=_cors_origins, credentials=not _allow_all)
 
 # Market hours context injection
 app.add_middleware(MarketHoursMiddleware)
+
+# Compress large candle/snapshot payloads ~5-10x on the wire — lets us return ALL
+# data (no truncation) while keeping transfer fast. Only kicks in above 1 KB, so
+# small quote responses and per-chunk SSE frames are untouched.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # ── Routers ──────────────────────────────────────────────────────────────────
