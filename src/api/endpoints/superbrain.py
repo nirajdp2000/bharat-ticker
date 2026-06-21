@@ -255,6 +255,16 @@ def _sb_quote(tick) -> dict[str, Any]:
         "live": quality == "REAL_TIME",
         "asOf": now_ist().isoformat(),
     }
+    # 52-week bounds must contain the live price + today's range. Upstream feeds
+    # (Groww yearHigh/Low) can lag a fresh intraday extreme, otherwise reporting a
+    # 52w-low ABOVE the current price (or a high below it) — logically wrong for a
+    # consumer. Clamp to the live price/low/high for consistency.
+    px, lo, hi = q.get("price"), q.get("low"), q.get("high")
+    if q.get("week52Low") is not None:
+        q["week52Low"] = min(x for x in (q["week52Low"], lo, px) if x is not None)
+    if q.get("week52High") is not None:
+        q["week52High"] = max(x for x in (q["week52High"], hi, px) if x is not None)
+
     # Drop optional fields that are genuinely unavailable (no null/empty in JSON).
     for k in _OPTIONAL_QUOTE_FIELDS:
         v = q.get(k)
