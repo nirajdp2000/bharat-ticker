@@ -68,6 +68,8 @@ class MarketDataService:
     def __init__(self) -> None:
         self._failover: FailoverController | None = None
         self._lock = asyncio.Lock()
+        # Background cache writes — held so the tasks aren't GC'd mid-flight.
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def _controller(self) -> FailoverController:
         if self._failover is not None:
@@ -125,14 +127,24 @@ class MarketDataService:
             log.warning("fetch_through_failed", symbol=symbol, source=source, error=str(e))
             return None
         if write_cache:
-            try:
-                from ..cache.ticker_cache import ticker_cache
-                await ticker_cache.set_tick(tick)
-                if tick.market_depth:
-                    await ticker_cache.set_market_depth(tick.symbol, tick.exchange, tick.market_depth)
-            except Exception as e:
-                log.debug("fetch_through_cache_write_failed", symbol=symbol, error=str(e))
+            # Fire-and-forget: the cache populate must NOT block the live quote
+            # response. Awaiting it would add a per-quote round-trip on the hot
+            # path the moment a *remote* Redis backs the cache (the in-process
+            # store is ~0ms, but this keeps low-latency backend-agnostic).
+            t = asyncio.create_task(self._write_cache(tick))
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
         return tick
+
+    async def _write_cache(self, tick: TickData) -> None:
+        """Populate the shared tick cache in the background (best-effort)."""
+        try:
+            from ..cache.ticker_cache import ticker_cache
+            await ticker_cache.set_tick(tick)
+            if tick.market_depth:
+                await ticker_cache.set_market_depth(tick.symbol, tick.exchange, tick.market_depth)
+        except Exception as e:
+            log.debug("fetch_through_cache_write_failed", symbol=tick.symbol, error=str(e))
 
     async def warm(self) -> None:
         """Pre-build the provider stack (and load the NSE archive) at startup
