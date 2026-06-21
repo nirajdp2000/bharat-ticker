@@ -18,6 +18,7 @@ from ..config.settings import settings
 from ..utils.fingerprint import fingerprint_mgr
 from ..utils.user_agents import ua_rotator
 from ..utils.logger import get_logger
+from .proxy_pool import proxy_pool
 
 log = get_logger(__name__)
 
@@ -27,43 +28,68 @@ class NSEPublic:
 
     def __init__(self) -> None:
         self._session: AsyncSession | None = None
+        self._proxy: str | None = None
         self._indices: list[dict[str, Any]] = []
         self._indices_at: float = 0.0
         self._lock = asyncio.Lock()
 
-    async def _ensure_session(self) -> None:
+    async def _ensure_session(self, rebuild: bool = False) -> None:
+        if rebuild and self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
         if self._session is None:
+            # Route through the current residential proxy when configured —
+            # unlocks the Akamai-gated NSE endpoints (quote-equity, option-chain).
+            self._proxy = proxy_pool.current()
             kwargs: dict[str, Any] = dict(
                 impersonate=fingerprint_mgr.get_random(),
                 timeout=settings.scrape_timeout_seconds,
                 verify=True,
             )
-            # Route through a residential proxy when configured — unlocks the
-            # Akamai-gated NSE endpoints (quote-equity, option-chain, …).
-            if settings.proxy_list:
-                proxy = settings.proxy_list[0]
-                kwargs["proxies"] = {"http": proxy, "https": proxy}
+            proxies = proxy_pool.as_proxies(self._proxy)
+            if proxies:
+                kwargs["proxies"] = proxies
             self._session = AsyncSession(**kwargs)
             try:
                 await self._session.get(settings.nse_base_url + "/", headers=ua_rotator.get_headers())
             except Exception:
                 pass
 
+    async def _rotate_session(self, reason: str) -> None:
+        """Park the current proxy and rebuild the session on the next one."""
+        proxy_pool.rotate(bad=self._proxy, reason=reason)
+        await self._ensure_session(rebuild=True)
+
     async def _nse_json(self, path: str, referer: str | None = None) -> dict[str, Any] | None:
-        """GET an NSE /api JSON path. Returns None on Akamai block / failure."""
-        await self._ensure_session()
-        try:
-            r = await self._session.get(
-                settings.nse_base_url + path,
-                headers=ua_rotator.get_headers(referer=referer or settings.nse_base_url + "/"),
-            )
-            if r.status_code == 200 and r.text[:1] in "{[":
-                return r.json()
-            if r.status_code in (401, 403):
-                return {"_blocked": True, "status": r.status_code}
-        except Exception as e:
-            log.debug("nse_json_failed", path=path, error=str(e))
-        return None
+        """GET an NSE /api JSON path. Returns None on failure, {"_blocked"} on
+        Akamai block. Rotates through PROXY_LIST on block/error when >1 proxy."""
+        attempts = min(proxy_pool.count, 3) if proxy_pool.count > 1 else 1
+        blocked: dict[str, Any] | None = None
+        for i in range(attempts):
+            await self._ensure_session()
+            try:
+                r = await self._session.get(
+                    settings.nse_base_url + path,
+                    headers=ua_rotator.get_headers(referer=referer or settings.nse_base_url + "/"),
+                )
+                if r.status_code == 200 and r.text[:1] in "{[":
+                    return r.json()
+                if r.status_code in (401, 403):
+                    blocked = {"_blocked": True, "status": r.status_code}
+                    if i < attempts - 1:
+                        await self._rotate_session(f"http_{r.status_code}")
+                        continue
+                    return blocked
+                return None  # other status → no retry
+            except Exception as e:
+                log.debug("nse_json_failed", path=path, error=str(e))
+                if i < attempts - 1:
+                    await self._rotate_session(f"exc_{type(e).__name__}")
+                    continue
+        return blocked
 
     @staticmethod
     def _proxy_note() -> dict[str, Any]:

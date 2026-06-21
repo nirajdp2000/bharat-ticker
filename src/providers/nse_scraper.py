@@ -32,6 +32,7 @@ from ..utils.fingerprint import fingerprint_mgr
 from ..utils.logger import get_logger
 from ..utils.user_agents import ua_rotator
 from .base import DataProvider, ProviderBlockedError, ProviderError, ProviderSchemaError
+from .proxy_pool import mask_proxy, proxy_pool
 
 log = get_logger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -48,6 +49,7 @@ class NSEScraper(DataProvider):
     def __init__(self) -> None:
         super().__init__()
         self._session: AsyncSession | None = None
+        self._proxy: str | None = None
         self._cookies: dict[str, str] = {}
         self._last_cookie_refresh: float = 0.0
         self._base_url: str = settings.nse_base_url
@@ -66,17 +68,33 @@ class NSEScraper(DataProvider):
             timeout=settings.scrape_timeout_seconds,
             verify=True,
         )
-        # Route through a proxy (e.g. residential Indian IP) when configured —
-        # this is what makes the Akamai-gated /api/quote-equity reachable from
-        # blocked networks.
-        if settings.proxy_list:
-            proxy = settings.proxy_list[0]
-            session_kwargs["proxies"] = {"http": proxy, "https": proxy}
-            log.info("nse_scraper_using_proxy", proxy=proxy.split("@")[-1])
+        # Route through the current rotating proxy (residential Indian IP) when
+        # configured — this is what makes the Akamai-gated /api/quote-equity
+        # reachable from blocked networks. Rotates on a persistent 403.
+        self._proxy = proxy_pool.current()
+        proxies = proxy_pool.as_proxies(self._proxy)
+        if proxies:
+            session_kwargs["proxies"] = proxies
+            log.info("nse_scraper_using_proxy", proxy=mask_proxy(self._proxy))
         self._session = AsyncSession(**session_kwargs)
         await self._refresh_cookies()
         self._is_connected = True
         log.info("nse_scraper_connected", cookies=len(self._cookies))
+
+    async def _rotate_session(self, reason: str) -> None:
+        """Park the current proxy, rebuild the session on the next one, re-warm
+        cookies. No-op rebuild when only one (or zero) proxy is configured."""
+        proxy_pool.rotate(bad=self._proxy, reason=reason)
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = None
+        self._cookies = {}
+        self._last_cookie_refresh = 0.0
+        self._is_connected = False
+        await self.connect()
 
     async def disconnect(self) -> None:
         """Close the session."""
@@ -197,7 +215,15 @@ class NSEScraper(DataProvider):
                 latency_ms = (time.time() - start) * 1000
 
                 if resp.status_code == 403:
-                    raise ProviderBlockedError(self.name, f"Blocked fetching {symbol}", 403)
+                    # Cookie refresh didn't clear it → likely an IP/Akamai block.
+                    # Rotate to the next proxy and try once more before giving up.
+                    if proxy_pool.count > 1:
+                        await self._rotate_session("http_403")
+                        await self._ensure_fresh_cookies()
+                        resp = await self._session.get(url, headers=headers, cookies=self._cookies)
+                        latency_ms = (time.time() - start) * 1000
+                    if resp.status_code == 403:
+                        raise ProviderBlockedError(self.name, f"Blocked fetching {symbol}", 403)
 
             if resp.status_code != 200:
                 self.record_error()
