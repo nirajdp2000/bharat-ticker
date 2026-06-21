@@ -17,9 +17,13 @@ never blocked.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import sqlalchemy as sa
 
 from ..db.connection import db_manager
 from ..db.queries import TickerQueries
@@ -28,6 +32,16 @@ from .live_candles import live_candle_engine
 
 log = get_logger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
+
+# Retention (vanilla Postgres has no TimescaleDB auto-policy, so the app prunes).
+INTRADAY_RETENTION_DAYS = int(os.environ.get("INTRADAY_RETENTION_DAYS", "60"))
+TICKS_RETENTION_DAYS = int(os.environ.get("TICKS_RETENTION_DAYS", "14"))
+PRUNE_INTERVAL_H = float(os.environ.get("PRUNE_INTERVAL_H", "24"))
+
+_PRUNE_INTRADAY = sa.text(
+    "DELETE FROM intraday_candles WHERE time < now() - make_interval(days => :d)")
+_PRUNE_TICKS = sa.text(
+    "DELETE FROM ticks WHERE time < now() - make_interval(days => :d)")
 
 # Per-symbol high-water mark of the last flushed 1s bar (incremental flush).
 _LAST_FLUSH_TS: dict[str, str] = {}
@@ -116,3 +130,45 @@ async def read_past_intraday(
         "volume": int(r["volume"] or 0), "oi": 0,
     } for r in rows]
     return {"captured": True, "candles": candles}
+
+
+# ── Retention prune (replaces TimescaleDB's auto-policy on vanilla Postgres) ──
+
+async def prune_old(intraday_days: int | None = None, ticks_days: int | None = None) -> dict[str, Any]:
+    """Delete sub-minute rows older than the retention window. No-op without DB."""
+    if not db_manager.is_connected:
+        return {"pruned": False, "reason": "no_db"}
+    idays = intraday_days or INTRADAY_RETENTION_DAYS
+    tdays = ticks_days or TICKS_RETENTION_DAYS
+    try:
+        session = db_manager.get_session()
+        async with session:
+            await session.execute(_PRUNE_INTRADAY, {"d": idays})
+            await session.execute(_PRUNE_TICKS, {"d": tdays})
+            await session.commit()
+        log.info("intraday_pruned", intradayDays=idays, ticksDays=tdays)
+        return {"pruned": True, "intradayDays": idays, "ticksDays": tdays}
+    except Exception as e:  # noqa: BLE001
+        log.warning("intraday_prune_failed", error=str(e))
+        return {"pruned": False, "error": str(e)}
+
+
+_prune_task: asyncio.Task | None = None
+
+
+async def _prune_loop() -> None:
+    # First prune shortly after boot, then every PRUNE_INTERVAL_H hours.
+    await asyncio.sleep(60)
+    while True:
+        await prune_old()
+        await asyncio.sleep(PRUNE_INTERVAL_H * 3600)
+
+
+def start_prune_scheduler() -> None:
+    """Launch the daily retention prune (idempotent; no-op until DB is up)."""
+    global _prune_task
+    if _prune_task and not _prune_task.done():
+        return
+    _prune_task = asyncio.create_task(_prune_loop())
+    log.info("prune_scheduler_started", intervalH=PRUNE_INTERVAL_H,
+             intradayDays=INTRADAY_RETENTION_DAYS, ticksDays=TICKS_RETENTION_DAYS)

@@ -60,6 +60,11 @@ async def lifespan(app: FastAPI):
     if watchlist_recorder.enabled:
         await watchlist_recorder.start()
 
+    # Daily retention prune (replaces TimescaleDB's auto-policy on vanilla PG so
+    # the 1s store can't fill the disk). No-op until a DB is connected.
+    from .engine.intraday_store import start_prune_scheduler
+    start_prune_scheduler()
+
     log.info("bharat_ticker_ready", port=settings.api_port)
 
     yield  # Application is running

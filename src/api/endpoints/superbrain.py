@@ -671,6 +671,17 @@ async def sb_recorder_set(symbols: str = Query(..., description="Comma-separated
     return {"status": "started", **watchlist_recorder.status()}
 
 
+@router.post("/prune", summary="Run the retention prune now")
+async def sb_prune(
+    intradayDays: int | None = Query(None, ge=1, description="Override intraday retention days"),
+    ticksDays: int | None = Query(None, ge=1, description="Override ticks retention days"),
+):
+    """Manually delete sub-minute rows older than the retention window. Runs
+    automatically every PRUNE_INTERVAL_H hours; this is the on-demand trigger."""
+    from ...engine.intraday_store import prune_old
+    return await prune_old(intradayDays, ticksDays)
+
+
 @router.get("/cache", summary="Intraday history cache stats")
 async def sb_cache_stats():
     """Size (entries + approx MB) + TTLs of the past/today candle caches."""
