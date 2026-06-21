@@ -1,0 +1,15 @@
+# Keep the build context (and image) lean — only pyproject/README/src are COPYed.
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.claude/
+tests/
+scripts/
+*.log
+.env
+.env.example
+START.md
+SUPERBRAIN_INTEGRATION_REQUIREMENTS.md
+start.bat
+run.py

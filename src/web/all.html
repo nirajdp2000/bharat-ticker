@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>All Stocks — Bharat Ticker</title>
+<style>
+  :root{--bg:#0b0f17;--panel:#121826;--panel2:#0e1420;--line:#1f2937;--txt:#e6edf3;
+    --mut:#8b97a8;--acc:#3b82f6;--grn:#22c55e;--red:#ef4444;--chip:#1b2434}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.4 -apple-system,Segoe UI,Roboto,Inter,sans-serif}
+  .wrap{max-width:1200px;margin:0 auto;padding:18px 16px 50px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:18px}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--acc);box-shadow:0 0 12px var(--acc)}
+  a.back{color:var(--mut);text-decoration:none;font-size:12px;border:1px solid var(--line);padding:6px 11px;border-radius:9px}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .pill{background:var(--chip);border:1px solid var(--line);color:var(--txt);padding:8px 14px;border-radius:10px;cursor:pointer;user-select:none}
+  .pill.active{border-color:var(--acc);background:#16243c}
+  input{flex:1;min-width:180px;background:var(--panel);border:1px solid var(--line);color:var(--txt);padding:10px 13px;border-radius:10px;outline:none;font-size:14px}
+  input:focus{border-color:var(--acc)}
+  .qf{font-size:12px;border:1px solid var(--line);background:var(--chip);color:var(--txt);padding:7px 12px;border-radius:9px;cursor:pointer}
+  .qf.active{border-color:var(--acc);color:#fff}
+  .stat{font-size:12px;color:var(--mut)}
+  .stat b{color:var(--txt)}
+  .up{color:var(--grn)} .down{color:var(--red)}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  thead th{position:sticky;top:0;background:var(--panel2);color:var(--mut);text-align:right;
+    padding:9px 10px;font-weight:600;cursor:pointer;border-bottom:1px solid var(--line);white-space:nowrap}
+  thead th.l{text-align:left}
+  thead th:hover{color:var(--txt)}
+  tbody td{text-align:right;padding:7px 10px;border-bottom:1px solid var(--line)}
+  tbody td.l{text-align:left}
+  tbody tr{cursor:pointer}
+  tbody tr:hover{background:#141c2b}
+  .sym{font-weight:600}
+  .ex{font-size:10px;color:var(--mut);background:var(--chip);padding:1px 6px;border-radius:5px;margin-left:6px}
+  .muted{color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><span class="dot"></span> All Stocks</div>
+    <a class="back" href="/ui">← dashboard</a>
+  </header>
+
+  <div class="bar">
+    <div class="pill active" data-ex="NSE">NSE</div>
+    <div class="pill" data-ex="BSE">BSE</div>
+    <div class="pill" data-ex="ALL">NSE + BSE</div>
+    <input id="q" placeholder="filter symbol…" autocomplete="off"/>
+  </div>
+  <div class="bar">
+    <span class="qf active" data-f="all">All</span>
+    <span class="qf" data-f="gainers">Top Gainers</span>
+    <span class="qf" data-f="losers">Top Losers</span>
+    <span class="qf" data-f="active">Most Active</span>
+    <span class="stat" id="stat" style="margin-left:auto">loading…</span>
+  </div>
+
+  <table>
+    <thead><tr>
+      <th class="l" data-k="symbol">Symbol</th>
+      <th data-k="ltp">LTP</th>
+      <th data-k="change">Chg</th>
+      <th data-k="pct_change">Chg %</th>
+      <th data-k="open">Open</th>
+      <th data-k="high">High</th>
+      <th data-k="low">Low</th>
+      <th data-k="volume">Volume</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="muted" id="more" style="text-align:center;padding:14px"></div>
+</div>
+
+<script>
+const API="/api/v1";
+let EX="NSE", DATA=[], VIEW=[], SORT={k:"symbol",dir:1}, QF="all", CAP=1200;
+const $=id=>document.getElementById(id);
+const fmt=n=>n==null?"—":Number(n).toLocaleString("en-IN",{maximumFractionDigits:2});
+const fmtV=n=>!n?"—":Number(n)>=1e7?(n/1e7).toFixed(2)+"Cr":Number(n)>=1e5?(n/1e5).toFixed(2)+"L":Number(n).toLocaleString("en-IN");
+
+async function fetchAll(){
+  $("stat").textContent="loading "+EX+"…";
+  const t=performance.now();
+  try{
+    const j=await (await fetch(`${API}/snapshot?exchange=${EX}&limit=99999`)).json();
+    DATA=j.data||[];
+    const ms=Math.round(performance.now()-t);
+    const adv=DATA.filter(d=>d.pct_change>0).length, dec=DATA.filter(d=>d.pct_change<0).length;
+    $("stat").innerHTML=`<b>${DATA.length}</b> stocks · <span class="up">${adv}▲</span> / <span class="down">${dec}▼</span> · ${ms}ms · ${j.data_quality||""}`;
+  }catch(e){$("stat").textContent="failed to load";DATA=[];}
+  apply();
+}
+
+function apply(){
+  const q=$("q").value.trim().toUpperCase();
+  let v=DATA;
+  if(q) v=v.filter(d=>d.symbol.includes(q));
+  if(QF==="gainers") v=[...v].sort((a,b)=>b.pct_change-a.pct_change);
+  else if(QF==="losers") v=[...v].sort((a,b)=>a.pct_change-b.pct_change);
+  else if(QF==="active") v=[...v].sort((a,b)=>b.volume-a.volume);
+  else{ const k=SORT.k; v=[...v].sort((a,b)=>{
+    let x=a[k],y=b[k]; if(typeof x==="string"){return SORT.dir*x.localeCompare(y);}
+    return SORT.dir*((x||0)-(y||0)); }); }
+  VIEW=v; render();
+}
+
+function render(){
+  const rows=VIEW.slice(0,CAP);
+  $("rows").innerHTML=rows.map(d=>{
+    const up=d.pct_change>=0;
+    return `<tr onclick="location.href='/ui?sym=${d.symbol}'">
+      <td class="l"><span class="sym">${d.symbol}</span>${EX==='ALL'?`<span class="ex">${d.exchange}</span>`:''}</td>
+      <td>${fmt(d.ltp)}</td>
+      <td class="${up?'up':'down'}">${up?'+':''}${fmt(d.change)}</td>
+      <td class="${up?'up':'down'}">${up?'+':''}${fmt(d.pct_change)}%</td>
+      <td>${fmt(d.open)}</td><td>${fmt(d.high)}</td><td>${fmt(d.low)}</td>
+      <td>${fmtV(d.volume)}</td></tr>`;}).join("");
+  $("more").textContent = VIEW.length>CAP ? `showing ${CAP} of ${VIEW.length} — refine filter to see more` : `${VIEW.length} rows`;
+}
+
+document.querySelectorAll(".pill").forEach(p=>p.onclick=()=>{
+  document.querySelectorAll(".pill").forEach(x=>x.classList.remove("active"));
+  p.classList.add("active"); EX=p.dataset.ex; fetchAll();});
+document.querySelectorAll(".qf").forEach(f=>f.onclick=()=>{
+  document.querySelectorAll(".qf").forEach(x=>x.classList.remove("active"));
+  f.classList.add("active"); QF=f.dataset.f; apply();});
+document.querySelectorAll("thead th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k; SORT.dir = SORT.k===k ? -SORT.dir : 1; SORT.k=k;
+  document.querySelectorAll(".qf").forEach(x=>x.classList.remove("active"));
+  document.querySelector('.qf[data-f="all"]').classList.add("active"); QF="all"; apply();});
+let deb; $("q").addEventListener("input",()=>{clearTimeout(deb);deb=setTimeout(apply,180);});
+
+fetchAll();
+setInterval(fetchAll, 30000);  // refresh every 30s
+</script>
+</body>
+</html>

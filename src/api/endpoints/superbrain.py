@@ -1,0 +1,840 @@
+"""Superbrain-compatible adapter endpoints (`/api/v1/sb/*`).
+
+These expose the EXACT field shapes the superbrain app consumes (camelCase
+quotes, numeric ascending candles, today-session intraday incl. 1s/10s live
+bars, full fundamentals, macro context, instrument resolver) so bharat-ticker
+can be its single market-data backend. Thin layer over the existing provider
+stack — no change to the core engine or the public `/api/v1` surface.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
+from ...engine import chartink, tickertape
+from ...engine.corp_actions import adjust_for_splits
+from ...engine.fundamentals import fetch_fundamentals
+from ...engine.intraday_builder import INTRADAY_SECONDS, points_to_ohlc
+from ...engine.live_candles import SAMPLE_INTERVAL_S, live_candle_engine
+from ...engine.macro import fetch_fii_dii, fetch_macro
+from ...engine.market_data import market_data_service
+from ...utils.ist_clock import is_market_open, now_ist
+from ...utils.logger import get_logger
+
+log = get_logger(__name__)
+router = APIRouter(prefix="/sb", tags=["Superbrain Adapter"])
+
+# symbol → (name, sector) — opportunistically filled from /details so quotes
+# stop returning null companyName/sector. 24h in-process cache.
+_META_CACHE: dict[str, dict[str, Any]] = {}
+
+# Deprecated/renamed symbol canonicalisation (shared with the core provider
+# stack) — post-demerger legacy tickers (e.g. TATAMOTORS → TMPV) map to their
+# original-ISIN successor so every endpoint returns ONE consistent instrument.
+from ...config.constants import canonical_symbol as _canon  # noqa: E402
+
+# Index pseudo-symbols are NOT equities — Groww/feeds return junk/stale values
+# for them. Block from the equity quote/candle paths; consumers use /sb/context
+# or /api/v1/indices for index values.
+_INDEX_SYMBOLS = {
+    "NIFTY", "NIFTY50", "NIFTY 50", "BANKNIFTY", "NIFTYBANK", "NIFTY BANK",
+    "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYIT", "NIFTYNXT50",
+}
+
+
+def _reject_index(symbol: str) -> None:
+    if symbol.upper() in _INDEX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{symbol}' is an index, not an equity. Use /api/v1/sb/context or /api/v1/indices.")
+
+
+def _latest_session_only(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the most recent trading day's bars (intraday = current session).
+
+    Tickertape's ``duration=1d`` returns ~1.5 sessions; without this the bar set
+    mixes two days and per-bar volume sums to ~1.6× the day's true volume.
+    """
+    if not candles:
+        return candles
+    last_date = candles[-1]["timestamp"][:10]
+    return [c for c in candles if c["timestamp"][:10] == last_date]
+
+# range → number of daily candles
+_RANGE_LIMIT = {
+    "1mo": 25, "3mo": 70, "6mo": 130, "1y": 260,
+    "2y": 520, "3y": 780, "5y": 1300, "max": 2500,
+}
+# superbrain/Upstox interval names → bharat (Yahoo/TSDB) interval codes
+_INTERVAL_MAP = {
+    "day": "1d", "1d": "1d", "week": "1w", "1w": "1w",
+    "30minute": "30m", "30m": "30m", "15minute": "15m", "15m": "15m",
+    "5minute": "5m", "5m": "5m", "1minute": "1m", "1m": "1m",
+}
+# Sub-minute / sub-second intervals → bucket seconds (float). Served by the live
+# tick-sampling engine (NSE/BSE feed, never delayed). Finest meaningful bucket is
+# bounded by the sampler cadence (LIVE_SAMPLE_INTERVAL_S, default 0.5s).
+_SECONDS_INTERVALS = {
+    "250ms": 0.25, "500ms": 0.5,
+    "1second": 1, "1s": 1,
+    "5second": 5, "5s": 5,
+    "10second": 10, "10s": 10,
+    "15second": 15, "15s": 15,
+    "30second": 30, "30s": 30,
+}
+
+# Max concurrent upstream fetches per bulk-quotes request (fan-out bound).
+_BULK_CONCURRENCY = 24
+
+
+def _f(v: Any) -> float | None:
+    try:
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _quality(source: str) -> str:
+    """Classify freshness from the serving source + market state."""
+    s = (source or "").lower()
+    if "yahoo" in s:
+        return "DELAYED"          # 15-min delayed feed
+    if "archive" in s:
+        return "END_OF_DAY"
+    return "REAL_TIME" if is_market_open() else "LAST_CLOSE"
+
+
+# Core fields are ALWAYS present (never null — verified). Rich fields are
+# included only when the serving source actually has them, so the JSON carries
+# no null/empty noise.
+_OPTIONAL_QUOTE_FIELDS = (
+    "upperCircuit", "lowerCircuit", "week52High", "week52Low",
+    "totalBuyQty", "totalSellQty", "openInterest", "vwap", "isin", "sector",
+)
+
+
+def _sb_quote(tick) -> dict[str, Any]:
+    """TickData → superbrain camelCase quote. Null rich fields are omitted."""
+    meta = _META_CACHE.get(tick.symbol, {})
+    quality = _quality(tick.source)
+    q = {
+        "symbol": tick.symbol,
+        "companyName": meta.get("name") or getattr(tick, "name", None) or tick.symbol,
+        "sector": meta.get("sector"),
+        "price": _f(tick.ltp),
+        "change": _f(tick.change),
+        "changePct": _f(tick.pct_change),
+        "open": _f(tick.open),
+        "high": _f(tick.high),
+        "low": _f(tick.low),
+        "volume": int(tick.volume or 0),
+        "previousClose": _f(tick.close),
+        "upperCircuit": _f(tick.upper_circuit),
+        "lowerCircuit": _f(tick.lower_circuit),
+        "week52High": _f(tick.week_52_high),
+        "week52Low": _f(tick.week_52_low),
+        "totalBuyQty": getattr(tick, "total_buy_qty", None),
+        "totalSellQty": getattr(tick, "total_sell_qty", None),
+        "openInterest": getattr(tick, "open_interest", None),
+        "vwap": _f(tick.vwap) or meta.get("vwap"),
+        "isin": getattr(tick, "isin", None) or meta.get("isin"),
+        "source": tick.source,
+        "dataQuality": quality,
+        "live": quality == "REAL_TIME",
+        "asOf": now_ist().isoformat(),
+    }
+    # Drop optional fields that are genuinely unavailable (no null/empty in JSON).
+    for k in _OPTIONAL_QUOTE_FIELDS:
+        v = q.get(k)
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            q.pop(k, None)
+    return q
+
+
+def _sb_quote_from_tt(symbol: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Tickertape batch row → superbrain quote (real NSE, non-delayed).
+
+    Row = {sid, price, close, change, high, low, volume, date}. Lacks ``open`` /
+    circuit / 52wk / OI (Groww-only) — those are filled per-symbol via /sb/quote
+    or by the Groww fallback. ``changePct`` is derived from change vs prev close.
+    """
+    meta = _META_CACHE.get(symbol, {})
+    price = _f(row.get("price"))
+    prev = _f(row.get("close"))
+    change = _f(row.get("change"))
+    pct = round(change / prev * 100, 2) if (change is not None and prev) else None
+    quality = "REAL_TIME" if is_market_open() else "LAST_CLOSE"
+    q = {
+        "symbol": symbol,
+        "companyName": meta.get("name") or symbol,
+        "sector": meta.get("sector"),
+        "price": price,
+        "change": change,
+        "changePct": pct,
+        "high": _f(row.get("high")),
+        "low": _f(row.get("low")),
+        "volume": int(_f(row.get("volume")) or 0),
+        "previousClose": prev,
+        "source": "tickertape_realtime_nse",
+        "dataQuality": quality,
+        "live": quality == "REAL_TIME",
+        "asOf": row.get("date") or now_ist().isoformat(),
+    }
+    if q["sector"] is None:
+        q.pop("sector", None)
+    return q
+
+
+async def _enrich_meta(symbol: str, exchange: str) -> None:
+    """Fill name/sector/isin cache (kills null companyName/sector/isin).
+
+    Tickertape search resolves name+sector fast; ISIN comes from the in-memory
+    BSE master (no HTTP). Details feed is the fallback for name/sector.
+    """
+    if symbol in _META_CACHE:
+        return
+    rec = None
+    try:
+        rec = await tickertape.resolve(symbol)
+    except Exception:  # noqa: BLE001
+        rec = None
+    isin = await market_data_service.get_isin(symbol)
+    if rec and rec.get("sector"):
+        _META_CACHE[symbol] = {"name": rec.get("name"), "sector": rec.get("sector"), "isin": isin}
+        return
+    try:
+        d = await market_data_service.get_details(symbol, "bse" if exchange == "BSE" else "auto")
+    except Exception:  # noqa: BLE001
+        d = None
+    if d:
+        _META_CACHE[symbol] = {
+            "name": d.get("name"),
+            "sector": (d.get("fundamentals") or {}).get("sector"),
+            "isin": isin or (d.get("fundamentals") or {}).get("isin"),
+            "vwap": _f((d.get("price") or {}).get("vwap")),
+        }
+    elif isin:
+        _META_CACHE[symbol] = {"isin": isin}
+
+
+def _norm_candles(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """get_history rows → numeric ascending {timestamp,o,h,l,c,v}."""
+    out: list[dict[str, Any]] = []
+    for c in rows:
+        ts = c.get("timestamp") or c.get("bucket") or c.get("date") or ""
+        out.append({
+            "timestamp": str(ts),
+            "open": _f(c.get("open")), "high": _f(c.get("high")),
+            "low": _f(c.get("low")), "close": _f(c.get("close")),
+            "volume": int(_f(c.get("volume")) or 0),
+        })
+    out = [c for c in out if c["close"] is not None]
+    out.sort(key=lambda c: c["timestamp"])
+    return out
+
+
+async def _live_quote(symbol: str, exchange: str):
+    """Live (NSE/BSE) quote when open; allow EOD/last-close when shut."""
+    tick = await market_data_service.get_quote_through(symbol, exchange, exclude_delayed=True)
+    if not tick and not is_market_open():
+        tick = await market_data_service.get_quote_through(symbol, exchange)
+    if tick:
+        # feed the live-candle sampler for free
+        try:
+            live_candle_engine.record(symbol, exchange, tick.ltp, tick.volume)
+        except Exception:  # noqa: BLE001
+            pass
+    return tick
+
+
+# ── Quotes ────────────────────────────────────────────────────────────────────
+
+@router.get("/quote/{symbol}", summary="Live quote (superbrain shape)")
+async def sb_quote(
+    symbol: str,
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    enrich: bool = Query(True, description="Fill companyName/sector"),
+):
+    original = (symbol or "").strip().upper()
+    _reject_index(original)
+    symbol = _canon(symbol)
+    if enrich:
+        await _enrich_meta(symbol, exchange)
+    tick = await _live_quote(symbol, exchange)
+    if not tick:
+        raise HTTPException(status_code=404, detail=f"No quote for {symbol}")
+    q = _sb_quote(tick)
+    if symbol != original:
+        q["aliasedFrom"] = original  # deprecated symbol canonicalised
+    return q
+
+
+async def _batch_quotes(syms: list[str], exchange: str = "NSE", rich: bool = False) -> dict[str, dict[str, Any]]:
+    """symbol → real-NSE quote, minimum latency, no broker / no delayed feed.
+
+    Fast path (NSE, not rich): Tickertape real-NSE batch, one HTTP per ~50-symbol
+    chunk. Anything the batch misses (and the whole set when rich/BSE) falls back
+    to the per-symbol Groww/MC live fan-out. Yahoo is never used.
+    """
+    by_sym: dict[str, dict[str, Any]] = {}
+    if exchange == "NSE" and not rich:
+        try:
+            rows = await tickertape.fetch_quotes(syms)
+        except Exception:  # noqa: BLE001
+            rows = {}
+        for s in syms:
+            row = rows.get(s) or rows.get(s.upper())
+            if row and _f(row.get("price")):
+                by_sym[s] = _sb_quote_from_tt(s, row)
+
+    missing = [s for s in syms if s not in by_sym]
+    if missing:
+        sem = asyncio.Semaphore(_BULK_CONCURRENCY)
+
+        async def _one(s: str):
+            async with sem:
+                try:
+                    tick = await _live_quote(s, exchange)
+                    return s, (_sb_quote(tick) if tick else None)
+                except Exception:  # noqa: BLE001
+                    return s, None
+
+        for s, q in await asyncio.gather(*(_one(s) for s in missing)):
+            if q:
+                by_sym[s] = q
+    return by_sym
+
+
+@router.get("/quotes", summary="Bulk live quotes (real-NSE batch, no broker / no delayed)")
+async def sb_quotes(
+    symbols: str = Query(..., description="Comma-separated symbols (max 200)"),
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    enrich: bool = Query(False, description="Fill companyName/sector (slower)"),
+    rich: bool = Query(False, description="Force Groww fan-out (adds open/circuit/52wk/OI, slower)"),
+):
+    """Bulk quotes optimised for universe sweeps — **no broker API, no delayed
+    data**.
+
+    Fast path (default, NSE): one HTTP per ~50-symbol chunk via Tickertape's real
+    NSE batch feed (``price/high/low/close/change/volume``). Any symbol the batch
+    misses falls back to the per-symbol Groww/MC live fan-out. Set ``rich=true``
+    (or use BSE) to take the Groww path for every symbol (adds
+    ``open/circuit/52wk/OI`` but is slower). Yahoo is never used here.
+    """
+    syms = [_canon(s) for s in symbols.split(",") if s.strip()][:200]
+    if not syms:
+        raise HTTPException(status_code=400, detail="No symbols")
+
+    by_sym = await _batch_quotes(syms, exchange, rich)
+
+    # optional name/sector enrichment (resolve cache → cheap)
+    if enrich:
+        for s in list(by_sym.keys()):
+            await _enrich_meta(s, exchange)
+            meta = _META_CACHE.get(s, {})
+            if meta.get("name"):
+                by_sym[s]["companyName"] = meta["name"]
+            if meta.get("sector"):
+                by_sym[s]["sector"] = meta["sector"]
+
+    out = [by_sym[s] for s in syms if s in by_sym]      # input order preserved
+    failed = [s for s in syms if s not in by_sym]
+    sources: dict[str, int] = {}
+    for q in out:
+        sources[q["source"]] = sources.get(q["source"], 0) + 1
+    return {"count": len(out), "failed": failed, "sources": sources, "quotes": out}
+
+
+# ── Candles ───────────────────────────────────────────────────────────────────
+
+async def _today_bar_from_quote(symbol: str, exchange: str) -> dict[str, Any] | None:
+    """Build TODAY's forming daily bar from the live quote (real, not delayed).
+
+    Yahoo's daily series lags the current session; overlay the live MC/BSE quote
+    so the latest daily candle is real-time.
+    """
+    tick = await _live_quote(symbol, exchange)
+    if not tick or _f(tick.ltp) is None:
+        return None
+    o, h, l, c = _f(tick.open), _f(tick.high), _f(tick.low), _f(tick.ltp)
+    return {
+        "timestamp": now_ist().date().isoformat() + "T00:00:00+05:30",
+        "open": o if o else c, "high": h if h else c, "low": l if l else c,
+        "close": c, "volume": int(tick.volume or 0), "live": True,
+        "source": tick.source,
+    }
+
+
+@router.get("/candles/{symbol}", summary="Daily candles (numeric, CA-adjusted, live today-bar)")
+async def sb_candles(
+    symbol: str,
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    range: str = Query("6mo"),
+    interval: str = Query("1d"),
+    adjust: bool = Query(True, description="Back-adjust splits/bonus"),
+    liveLast: bool = Query(True, description="Overlay today's forming bar with the live quote"),
+):
+    _reject_index(symbol)
+    symbol = _canon(symbol)
+    code = _INTERVAL_MAP.get(interval, "1d")
+    limit = _RANGE_LIMIT.get(range, 130)
+    rows = await market_data_service.get_history(symbol, exchange, code, limit=limit)
+    candles = _norm_candles(rows)
+    events: list[dict[str, Any]] = []
+    if adjust and code in ("1d", "1w"):
+        candles, events = adjust_for_splits(candles)
+
+    # Overlay/append today's REAL forming bar (kills Yahoo's delayed last bar).
+    live_overlay = False
+    if liveLast and code == "1d" and is_market_open():
+        tb = await _today_bar_from_quote(symbol, exchange)
+        if tb:
+            today = now_ist().date().isoformat()
+            if candles and candles[-1]["timestamp"][:10] == today:
+                candles[-1] = {k: tb[k] for k in ("timestamp", "open", "high", "low", "close", "volume")}
+            else:
+                candles.append({k: tb[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
+            live_overlay = True
+
+    return {
+        "symbol": symbol, "exchange": exchange, "interval": code, "range": range,
+        "count": len(candles), "adjusted": bool(events), "splitEvents": events,
+        "liveLastBar": live_overlay, "candles": candles,
+    }
+
+
+@router.get("/intraday/{symbol}", summary="Real-time intraday candles (BSE live + 1s/10s tick)")
+async def sb_intraday(
+    symbol: str,
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    interval: str = Query("30minute"),
+    limit: int = Query(400, ge=1, le=2000),
+):
+    """``interval`` options, fastest first:
+    - ``1second`` / ``10second`` → live tick aggregation (NSE/BSE relay, sub-second).
+    - ``1minute``…``30minute`` → REAL BSE intraday curve (StockReachGraph),
+      falling back to Yahoo only if BSE has no data for the symbol.
+    """
+    _reject_index(symbol)
+    symbol = _canon(symbol)
+
+    # Sub-minute → live sampled aggregation (lowest latency)
+    if interval in _SECONDS_INTERVALS:
+        seconds = _SECONDS_INTERVALS[interval]
+        await live_candle_engine.ensure_recorder(symbol, exchange)
+        await live_candle_engine.sample_once(symbol, exchange)
+        candles = live_candle_engine.build(symbol, exchange, seconds, limit=limit)
+        st = live_candle_engine.status(symbol, exchange)
+        return {
+            "symbol": symbol, "exchange": exchange, "interval": interval,
+            "granularitySeconds": seconds, "source": "live_tick_aggregation",
+            "dataQuality": "REAL_TIME" if st["market_open"] else "STALE_NO_SESSION",
+            "warmingUp": len(candles) < 3, "recording": st["recording"],
+            "marketOpen": st["market_open"], "samples": st["samples"],
+            "count": len(candles), "candles": candles,
+        }
+
+    if interval not in INTRADAY_SECONDS:
+        supported = sorted(set(_SECONDS_INTERVALS) | set(INTRADAY_SECONDS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported intraday interval '{interval}'. Supported: {supported}")
+    seconds = INTRADAY_SECONDS[interval]
+
+    # PRIMARY: real NSE intraday from Tickertape → aggregate to the timeframe.
+    try:
+        tt_points = await tickertape.fetch_intraday_points(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        tt_points = None
+    if tt_points:
+        candles = _latest_session_only(points_to_ohlc(tt_points, seconds, limit=limit + 200))[-limit:]
+        if candles:
+            return {
+                "symbol": symbol, "exchange": "NSE", "interval": interval,
+                "source": "tickertape_realtime_nse",
+                "dataQuality": "REAL_TIME" if is_market_open() else "TODAY_SESSION",
+                "sessionDate": candles[-1]["timestamp"][:10],
+                "count": len(candles), "candles": candles,
+            }
+
+    # SECONDARY: real BSE intraday curve (StockReachGraph).
+    points = await market_data_service.get_intraday_series(symbol, "0")
+    if points:
+        candles = _latest_session_only(points_to_ohlc(points, seconds, limit=limit + 200))[-limit:]
+        if candles:
+            return {
+                "symbol": symbol, "exchange": "BSE", "interval": interval,
+                "source": "bse_stockreach_realtime",
+                "dataQuality": "REAL_TIME" if is_market_open() else "TODAY_SESSION",
+                "sessionDate": candles[-1]["timestamp"][:10],
+                "count": len(candles), "candles": candles,
+            }
+
+    # FALLBACK: Yahoo intraday (delayed) — only when both real feeds miss.
+    code = _INTERVAL_MAP.get(interval)
+    rows = await market_data_service.get_history(symbol, exchange, code, limit=limit) if code else []
+    candles = _norm_candles(rows)
+    today = now_ist().date().isoformat()
+    today_bars = [c for c in candles if c["timestamp"][:10] == today]
+    served = today_bars if today_bars else candles[-limit:]
+    for c in served:
+        c["oi"] = 0
+    return {
+        "symbol": symbol, "exchange": exchange, "interval": code,
+        "source": "yahoo_intraday_delayed", "dataQuality": "DELAYED",
+        "todayOnly": bool(today_bars),
+        "note": "real NSE/BSE intraday unavailable for this symbol — Yahoo fallback (15-min delayed)",
+        "count": len(served), "candles": served,
+    }
+
+
+@router.get("/intervals", summary="All supported candle timeframes")
+async def sb_intervals():
+    """Every timeframe the feed serves, fastest first — for the live-study UI."""
+    return {
+        "subSecondAndSeconds": {
+            "intervals": list(_SECONDS_INTERVALS),
+            "source": "live_tick_aggregation (NSE/BSE feed sampled, never delayed)",
+            "finestSeconds": min(_SECONDS_INTERVALS.values()),
+            "samplerCadenceSeconds": SAMPLE_INTERVAL_S,
+            "note": "bucket resolution is bounded by the sampler cadence",
+        },
+        "minutesAndHours": {
+            "intervals": sorted(set(INTRADAY_SECONDS)),
+            "source": "tickertape_realtime_nse -> bse_stockreach_realtime -> yahoo(last resort)",
+        },
+        "daily": {"endpoint": "/sb/candles", "ranges": list(_RANGE_LIMIT)},
+        "stream": {"endpoint": "/sb/stream/{symbol}", "transport": "SSE",
+                   "note": "server-push ticks, lowest latency"},
+    }
+
+
+@router.get("/stream/{symbol}", summary="Live tick stream (SSE, minimum latency, no broker)")
+async def sb_stream(
+    symbol: str,
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    maxSeconds: int = Query(300, ge=5, le=3600, description="Auto-close after N seconds"),
+):
+    """Server-Sent-Events tick stream — pushes each new sampled tick the instant
+    it is recorded (no client polling gap). Backed by the live-candle sampler
+    (Groww/MC NSE/BSE feed, never delayed). Lowest-latency way to study live.
+
+    Consume with EventSource('/api/v1/sb/stream/RELIANCE'); each `data:` line is
+    `{timestamp, epoch, price, cumVolume}`.
+    """
+    _reject_index(symbol)
+    symbol = _canon(symbol)
+    await live_candle_engine.ensure_recorder(symbol, exchange)
+
+    async def gen():
+        yield f"event: open\ndata: {json.dumps({'symbol': symbol, 'exchange': exchange, 'marketOpen': is_market_open(), 'samplerSeconds': SAMPLE_INTERVAL_S})}\n\n"
+        start = time.time()
+        last_epoch = None
+        poll = 0.2  # read faster than the sampler so a new tick is forwarded promptly
+        while time.time() - start < maxSeconds:
+            # keep the recorder alive + grab the freshest sample
+            tick = live_candle_engine.latest_tick(symbol, exchange)
+            if tick and tick["epoch"] != last_epoch:
+                last_epoch = tick["epoch"]
+                yield f"data: {json.dumps(tick)}\n\n"
+            else:
+                yield ": keep-alive\n\n"   # comment frame keeps the connection open
+            await asyncio.sleep(poll)
+        yield f"event: close\ndata: {json.dumps({'reason': 'maxSeconds reached'})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.get("/history/{symbol}", summary="Dated candles (day/30minute, +oi, CA-adjusted)")
+async def sb_history(
+    symbol: str,
+    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    interval: str = Query("day"),
+    from_: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
+    to: str | None = Query(None, description="YYYY-MM-DD"),
+    adjust: bool = Query(True),
+):
+    symbol = _canon(symbol)
+    code = _INTERVAL_MAP.get(interval)
+    if not code:
+        raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
+
+    def _parse(d: str) -> datetime:
+        try:
+            return datetime.strptime(d, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date: {d}")
+
+    end_dt = _parse(to) if to else now_ist().replace(tzinfo=None)
+    start_dt = _parse(from_) if from_ else end_dt - timedelta(days=365)
+    rows = await market_data_service.get_history(
+        symbol, exchange, code, start=start_dt, end=end_dt, limit=5000)
+    candles = _norm_candles(rows)
+    events: list[dict[str, Any]] = []
+    if adjust and code in ("1d", "1w"):
+        candles, events = adjust_for_splits(candles)
+    for c in candles:
+        c.setdefault("oi", 0)
+    return {
+        "symbol": symbol, "exchange": exchange, "interval": code,
+        "from": start_dt.date().isoformat(), "to": end_dt.date().isoformat(),
+        "count": len(candles), "adjusted": bool(events), "splitEvents": events,
+        "candles": candles,
+    }
+
+
+# ── Fundamentals ───────────────────────────────────────────────────────────────
+
+@router.get("/fundamentals/{symbol}", summary="Full fundamental ratio set")
+async def sb_fundamentals(symbol: str):
+    data = await fetch_fundamentals(_canon(symbol))
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No fundamentals for {symbol}")
+    return data
+
+
+# ── Macro context ──────────────────────────────────────────────────────────────
+
+@router.get("/context", summary="Indices + macro + FII/DII (regime context)")
+async def sb_context():
+    indices_raw = await market_data_service.get_indices()
+    by_name = {(d.get("index") or "").upper(): d for d in indices_raw}
+
+    def idx(name: str) -> dict[str, Any] | None:
+        d = by_name.get(name.upper())
+        if not d:
+            return None
+        return {"last": _f(d.get("last")), "changePct": _f(d.get("pct_change")),
+                "change": _f(d.get("change")),
+                "advances": d.get("advances"), "declines": d.get("declines")}
+
+    indices = {n: idx(n) for n in ("NIFTY 50", "NIFTY BANK", "NIFTY NEXT 50",
+                                   "NIFTY IT", "NIFTY MIDCAP 100") if idx(n)}
+    vix = idx("INDIA VIX")
+    macro = await fetch_macro()
+    fii_dii = await fetch_fii_dii()
+    try:
+        mmi = await tickertape.fetch_mmi()
+    except Exception:  # noqa: BLE001
+        mmi = None
+
+    nifty_pct = (indices.get("NIFTY 50") or {}).get("changePct") or 0
+    usdinr_pct = (macro.get("USDINR") or {}).get("changePct") or 0
+    brent_pct = (macro.get("BRENT") or {}).get("changePct") or 0
+    risk_on = nifty_pct - max(0, usdinr_pct * 0.8) - max(0, brent_pct * 0.5)
+    regime = "RISK_ON" if risk_on >= 0.8 else "RISK_OFF" if risk_on <= -0.8 else "BALANCED"
+
+    return {
+        "regime": regime,
+        "riskOnScore": round(risk_on, 2),
+        "indices": indices,
+        "vix": (vix or {}).get("last"),
+        "macro": macro,
+        "fiiDii": fii_dii,
+        "marketMood": mmi,
+        "marketOpen": is_market_open(),
+        "generatedAt": now_ist().isoformat(),
+    }
+
+
+@router.get("/mmi", summary="Market Mood Index (Tickertape sentiment gauge)")
+async def sb_mmi():
+    mmi = await tickertape.fetch_mmi()
+    if not mmi:
+        raise HTTPException(status_code=503, detail="MMI unavailable")
+    return mmi
+
+
+# ── Screener (Chartink) ─────────────────────────────────────────────────────────
+
+@router.get("/scans", summary="List built-in Chartink scan names")
+async def sb_scans():
+    return {"scans": sorted(chartink.PREBUILT_SCANS.keys()),
+            "usage": "/sb/screen?scan=<name>  OR  POST /sb/screen {clause}"}
+
+
+@router.get("/screen", summary="Run a Chartink screener (real-NSE prices overlaid)")
+async def sb_screen(
+    scan: str | None = Query(None, description="Built-in scan name (see /sb/scans)"),
+    clause: str | None = Query(None, description="Raw Chartink scan_clause"),
+    limit: int = Query(500, ge=1, le=2000),
+    live: bool = Query(True, description="Overlay row price/changePct/volume with the real-NSE feed"),
+    liveLimit: int = Query(200, ge=1, le=500, description="Max rows to re-price live"),
+):
+    """Chartink decides **which symbols match** the scan; the row
+    ``close/changePct/volume`` it returns is Chartink's own (free intraday feed
+    lags). With ``live=true`` (default) those fields are overlaid with our
+    minimum-latency real-NSE feed (Tickertape batch → Groww), so the prices are
+    fresh — Chartink's stale value is kept as ``chartinkClose`` for reference.
+    """
+    raw = clause or (chartink.PREBUILT_SCANS.get(scan) if scan else None)
+    if not raw:
+        raise HTTPException(status_code=400,
+                            detail=f"Provide ?scan= (one of {sorted(chartink.PREBUILT_SCANS)}) or ?clause=")
+    result = await chartink.run_scan(raw, limit=limit)
+    if result is None:
+        raise HTTPException(status_code=503, detail="Chartink unavailable")
+
+    price_source = "chartink_delayed"
+    price_quality = "DELAYED"
+    if live and result.get("stocks"):
+        # re-price the matched symbols with the real-NSE feed (Chartink stays the
+        # scan engine; only the displayed numbers are swapped for fresh ones).
+        head = [r for r in result["stocks"][:liveLimit] if r.get("symbol")]
+        canon = list({_canon(r["symbol"]) for r in head})
+        try:
+            live_map = await _batch_quotes(canon, "NSE", rich=False)
+        except Exception:  # noqa: BLE001
+            live_map = {}
+        srcs: dict[str, int] = {}
+        for r in result["stocks"]:
+            q = live_map.get(_canon(r.get("symbol") or ""))
+            if not q:
+                continue
+            if r.get("close") is not None:
+                r["chartinkClose"] = r.get("close")
+            r["close"] = q.get("price")
+            r["price"] = q.get("price")
+            if q.get("changePct") is not None:
+                r["changePct"] = q["changePct"]
+            if q.get("volume") is not None:
+                r["volume"] = q["volume"]
+            r["priceSource"] = q.get("source")
+            srcs[q.get("source")] = srcs.get(q.get("source"), 0) + 1
+        if srcs:
+            price_source = srcs
+            price_quality = "REAL_TIME" if is_market_open() else "LAST_CLOSE"
+
+    return {"scan": scan, "clause": raw, **result,
+            "priceSource": price_source, "priceQuality": price_quality,
+            "livePriced": bool(live), "asOf": now_ist().isoformat()}
+
+
+# ── Universe / resolver ────────────────────────────────────────────────────────
+
+@router.get("/universe", summary="Instrument universe (symbol → identity)")
+async def sb_universe(
+    exchange: str = Query("NSE"),
+    limit: int = Query(6000, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
+):
+    rows = await market_data_service.get_all_snapshot(exchange.strip().upper())
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    items = [{
+        "symbol": r.get("symbol"),
+        "name": r.get("name") or r.get("symbol"),
+        "sector": r.get("sector"),
+        "exchange": r.get("exchange", exchange.upper()),
+        "series": r.get("series"),
+        "isin": r.get("isin"),
+    } for r in page]
+    return {"exchange": exchange.upper(), "total": total, "count": len(items), "items": items}
+
+
+@router.get("/resolve", summary="Resolve a symbol / company name / alias")
+async def sb_resolve(q: str = Query(..., min_length=1), exchange: str = Query("NSE")):
+    ql = q.strip().upper()
+    rows = await market_data_service.get_all_snapshot(exchange.strip().upper())
+    matches = []
+    for r in rows:
+        sym = str(r.get("symbol") or "").upper()
+        if ql == sym:
+            matches.insert(0, r)
+        elif ql in sym:
+            matches.append(r)
+        if len(matches) >= 20:
+            break
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No instrument matching '{q}'")
+    return {"query": q, "count": len(matches), "matches": [{
+        "symbol": r.get("symbol"), "name": r.get("name") or r.get("symbol"),
+        "exchange": r.get("exchange", exchange.upper()), "isin": r.get("isin"),
+        "series": r.get("series"),
+    } for r in matches[:20]]}
+
+
+# ── Data-availability diagnostics ───────────────────────────────────────────────
+
+@router.get("/diagnostics/{symbol}", summary="Probe every source; report null/stale data")
+async def sb_diagnostics(symbol: str, exchange: str = Query("NSE", regex="^(NSE|BSE)$")):
+    """Per-source availability matrix for a symbol — surfaces null/incorrect data.
+
+    Probes the real feeds (live quote, BSE intraday, daily history, fundamentals,
+    details) and reports what each returns, which fields are null, and the best
+    real-data source available right now.
+    """
+    import time as _time
+    symbol = _canon(symbol)
+    report: dict[str, Any] = {"symbol": symbol, "exchange": exchange,
+                              "marketOpen": is_market_open(), "sources": {}}
+
+    async def probe(name: str, coro):
+        t0 = _time.time()
+        try:
+            res = await coro
+            return name, {"ok": bool(res), "latencyMs": round((_time.time() - t0) * 1000, 1), "data": res}
+        except Exception as e:  # noqa: BLE001
+            return name, {"ok": False, "latencyMs": round((_time.time() - t0) * 1000, 1), "error": str(e)[:140]}
+
+    # Live quote (real)
+    _, q = await probe("live_quote", market_data_service.get_quote_through(symbol, exchange, exclude_delayed=True))
+    tick = q.pop("data", None)
+    if tick:
+        sbq = _sb_quote(tick)
+        q["source"] = sbq["source"]
+        q["dataQuality"] = sbq["dataQuality"]
+        q["nullFields"] = [k for k, v in sbq.items() if v is None]
+        q["ltp"] = sbq["price"]
+    report["sources"]["live_quote"] = q
+
+    # Tickertape intraday (real NSE — intraday primary)
+    _, tt = await probe("tickertape_intraday", tickertape.fetch_intraday_points(symbol, "1d"))
+    ttp = tt.pop("data", None)
+    tt["points"] = len(ttp) if ttp else 0
+    tt["lastPoint"] = ttp[-1] if ttp else None
+    report["sources"]["tickertape_intraday"] = tt
+
+    # BSE intraday curve (real — intraday secondary)
+    _, intr = await probe("bse_intraday", market_data_service.get_intraday_series(symbol, "0"))
+    pts = intr.pop("data", None)
+    intr["points"] = len(pts) if pts else 0
+    intr["lastPoint"] = pts[-1] if pts else None
+    report["sources"]["bse_intraday"] = intr
+
+    # Daily history (Yahoo completed)
+    _, dh = await probe("daily_history", market_data_service.get_history(symbol, exchange, "1d", limit=3))
+    rows = dh.pop("data", None)
+    dh["candles"] = len(rows) if rows else 0
+    dh["lastClose"] = _f(rows[-1].get("close")) if rows else None
+    report["sources"]["daily_history"] = dh
+
+    # Fundamentals
+    _, fu = await probe("fundamentals", fetch_fundamentals(symbol))
+    fdata = fu.pop("data", None)
+    if fdata:
+        fu["source"] = fdata.get("source")
+        fu["presentFields"] = [k for k, v in fdata.items() if v is not None and k not in ("symbol", "source")]
+        fu["nullFields"] = [k for k, v in fdata.items() if v is None]
+    report["sources"]["fundamentals"] = fu
+
+    # Overall verdict
+    live_ok = report["sources"]["live_quote"].get("ok")
+    tt_real = report["sources"]["tickertape_intraday"]["points"] > 0
+    bse_real = report["sources"]["bse_intraday"]["points"] > 0
+    report["verdict"] = {
+        "liveQuote": "REAL" if live_ok else "UNAVAILABLE",
+        "intraday": "REAL_NSE_TICKERTAPE" if tt_real else "REAL_BSE" if bse_real else "YAHOO_FALLBACK_OR_NONE",
+        "daily": "OK" if report["sources"]["daily_history"]["candles"] > 0 else "UNAVAILABLE",
+        "fundamentals": "OK" if report["sources"]["fundamentals"].get("ok") else "UNAVAILABLE",
+    }
+    return report
