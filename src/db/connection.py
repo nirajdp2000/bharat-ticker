@@ -111,8 +111,14 @@ class DatabaseManager:
             return
         try:
             sql = schema.read_text(encoding="utf-8")
-            async with self._engine.begin() as conn:
-                await conn.exec_driver_sql(sql)   # simple-query protocol → multi-statement
+            # asyncpg rejects multi-statement strings through the prepared-statement
+            # path (exec_driver_sql → "cannot insert multiple commands into a
+            # prepared statement"), which silently dropped the WHOLE schema. Reach
+            # the raw asyncpg connection and use its simple-query protocol, which
+            # runs the full file in one shot (incl. the guarded DO $$ block).
+            async with self._engine.connect() as conn:
+                raw = await conn.get_raw_connection()
+                await raw.driver_connection.execute(sql)
             log.info("database_schema_applied")
         except Exception as e:  # noqa: BLE001
             log.warning("database_schema_apply_failed", error=str(e))
