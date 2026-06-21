@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ssl as _ssl
+from typing import Any
+
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -9,6 +13,44 @@ from ..config.settings import settings
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# libpq/psycopg query params that asyncpg does NOT understand — must be stripped
+# from the URL and translated into connect_args (asyncpg wants ssl=SSLContext).
+_LIBPQ_SSL_KEYS = ("sslmode", "channel_binding", "sslrootcert", "sslcert", "sslkey")
+
+
+def _normalize_db_url(raw: str) -> tuple[Any, dict[str, Any]]:
+    """Coerce any Postgres URL into an asyncpg URL + connect_args.
+
+    Accepts plain ``postgresql://`` (e.g. straight from Northflank/Supabase with
+    ``?sslmode=require``) and returns a ``postgresql+asyncpg`` URL with the libpq
+    ssl params removed, plus an ssl SSLContext when TLS is requested. This lets a
+    deployer paste the provider's URI verbatim and have it connect over TLS.
+    """
+    url = make_url(raw)
+    # Force the asyncpg driver regardless of how the URL was written.
+    if url.drivername in ("postgresql", "postgres", "postgresql+psycopg2", "postgresql+psycopg"):
+        url = url.set(drivername="postgresql+asyncpg")
+
+    query = dict(url.query)
+    sslmode = (query.get("sslmode") or query.get("ssl") or "").lower()
+    for k in (*_LIBPQ_SSL_KEYS, "ssl"):
+        query.pop(k, None)
+    url = url.set(query=query)
+
+    connect_args: dict[str, Any] = {}
+    want_tls = sslmode in ("require", "prefer", "allow", "verify-ca", "verify-full", "true", "1")
+    if want_tls:
+        ctx = _ssl.create_default_context()
+        # require/prefer = encrypt without CA verification (managed addons use a
+        # self-signed/internal CA); verify-* keeps full verification.
+        if sslmode in ("verify-ca", "verify-full"):
+            pass
+        else:
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+        connect_args["ssl"] = ctx
+    return url, connect_args
 
 
 class DatabaseManager:
@@ -23,12 +65,14 @@ class DatabaseManager:
         if self._engine is not None:
             return
 
+        url, connect_args = _normalize_db_url(settings.database_url)
         self._engine = create_async_engine(
-            settings.database_url,
+            url,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
             pool_pre_ping=True,
             pool_recycle=3600,
+            connect_args=connect_args,
             echo=settings.debug and not settings.is_production,
         )
         self._session_factory = sessionmaker(
@@ -52,6 +96,26 @@ class DatabaseManager:
             self._engine = None
             self._session_factory = None
             raise
+
+        # Auto-apply the schema (idempotent: CREATE … IF NOT EXISTS + guarded
+        # Timescale block). Runs from INSIDE the deploy where the addon host
+        # resolves, so no manual psql is needed. Best-effort — a schema hiccup
+        # must not knock the DB offline.
+        await self._apply_schema()
+
+    async def _apply_schema(self) -> None:
+        from pathlib import Path
+
+        schema = Path(__file__).resolve().parent / "schema.sql"
+        if not schema.exists():
+            return
+        try:
+            sql = schema.read_text(encoding="utf-8")
+            async with self._engine.begin() as conn:
+                await conn.exec_driver_sql(sql)   # simple-query protocol → multi-statement
+            log.info("database_schema_applied")
+        except Exception as e:  # noqa: BLE001
+            log.warning("database_schema_apply_failed", error=str(e))
 
     async def disconnect(self) -> None:
         """Dispose of the engine and close all connections."""
