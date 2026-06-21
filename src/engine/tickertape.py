@@ -49,6 +49,14 @@ _search_cooldown_until = 0.0
 _SEARCH_MIN_GAP = 0.6        # min seconds between /search calls (no bursts)
 _SEARCH_COOLDOWN_S = 120.0   # park /search this long after a 403
 
+# Bulk sid map — /stocks/list returns the WHOLE universe (~5768 ticker→sid) in
+# ONE un-rate-limited call, so ANY symbol resolves WITHOUT /search. Loaded lazily,
+# refreshed daily. /search stays only as a last resort for renamed/absent tickers.
+_all_sids: dict[str, str] = {}
+_all_sids_at = 0.0
+_all_sids_lock = asyncio.Lock()
+_SIDMAP_TTL = 86400.0
+
 
 async def _get(path: str, params: dict | None = None) -> Any | None:
     status, j = await _get_raw(path, params)
@@ -92,8 +100,30 @@ async def _search(text: str) -> Any | None:
         return j
 
 
+async def _ensure_sid_map() -> None:
+    """Load the full ticker→sid universe from /stocks/list (one call, daily TTL)."""
+    global _all_sids, _all_sids_at
+    if _all_sids and (time.time() - _all_sids_at) < _SIDMAP_TTL:
+        return
+    async with _all_sids_lock:
+        if _all_sids and (time.time() - _all_sids_at) < _SIDMAP_TTL:
+            return
+        j = await _get("/stocks/list")
+        rows = (j or {}).get("data") or []
+        m = {}
+        for x in rows:
+            t = str(x.get("ticker", "")).upper()
+            sid = x.get("sid")
+            if t and sid:
+                m[t] = sid
+        if m:
+            _all_sids = m
+            _all_sids_at = time.time()
+            log.info("tickertape_sid_map_loaded", count=len(m))
+
+
 async def resolve(symbol: str) -> dict[str, Any] | None:
-    """symbol → {sid, sector, name}. Seed → process cache → throttled /search."""
+    """symbol → {sid, sector, name}. Seed → bulk sid map → cache → /search (last resort)."""
     symbol = symbol.strip().upper()
     if symbol in _sid_cache:
         return _sid_cache[symbol]
@@ -102,6 +132,14 @@ async def resolve(symbol: str) -> dict[str, Any] | None:
         rec = {"sid": seed, "sector": None, "name": None}
         _sid_cache[symbol] = rec
         return rec
+    # Bulk universe map — resolves any listed ticker with NO /search.
+    await _ensure_sid_map()
+    sid = _all_sids.get(symbol)
+    if sid:
+        rec = {"sid": sid, "sector": None, "name": None}
+        _sid_cache[symbol] = rec
+        return rec
+    # Last resort: throttled /search for renamed/absent tickers.
     j = await _search(symbol)
     stocks = ((j or {}).get("data") or {}).get("stocks") or []
     # Prefer exact ticker match.
