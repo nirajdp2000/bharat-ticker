@@ -12,6 +12,7 @@ maps and caches it.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -30,8 +31,31 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _sid_cache: dict[str, dict[str, Any]] = {}   # symbol → {sid, sector, name}
 _mmi_cache: tuple[float, dict[str, Any]] | None = None
 
+# /search is per-IP RATE-LIMITED (403 REQUEST_LIMIT_EXCEEDED). The data
+# endpoints (/stocks/quotes, /stocks/charts) are NOT — so the failure mode was
+# self-inflicted: a sweep fired _RESOLVE_CONCURRENCY=16 concurrent /search calls,
+# tripped the limit, and EVERY tickertape read then cascaded to fail. Fix:
+#   1. seed verified sids so the hot path needs no /search,
+#   2. serialize + pace /search through one lock,
+#   3. on 403, cooldown — stop calling /search so resolve() returns fast and the
+#      caller cleanly fails over to Groww/BSE instead of hammering a limited API.
+# Only VERIFIED sids are seeded (a wrong sid = wrong stock's data).
+_SID_SEED: dict[str, str] = {
+    "RELIANCE": "RELI",
+}
+_search_lock = asyncio.Lock()
+_last_search_ts = 0.0
+_search_cooldown_until = 0.0
+_SEARCH_MIN_GAP = 0.6        # min seconds between /search calls (no bursts)
+_SEARCH_COOLDOWN_S = 120.0   # park /search this long after a 403
+
 
 async def _get(path: str, params: dict | None = None) -> Any | None:
+    status, j = await _get_raw(path, params)
+    return j
+
+
+async def _get_raw(path: str, params: dict | None = None) -> tuple[int | None, Any | None]:
     # Fresh session per call — a module-global AsyncSession binds to the event
     # loop it was created on and fails on later requests (different loop).
     try:
@@ -40,18 +64,45 @@ async def _get(path: str, params: dict | None = None) -> Any | None:
             r = await s.get(f"{BASE}{path}", params=params or {},
                             headers={"User-Agent": UA, "Accept": "application/json"})
             if r.status_code == 200 and r.text[:1] in "{[":
-                return r.json()
+                return 200, r.json()
+            return r.status_code, None
     except Exception as e:  # noqa: BLE001
         log.debug("tickertape_get_failed", path=path, error=str(e))
-    return None
+        return None, None
+
+
+async def _search(text: str) -> Any | None:
+    """Throttled, cooldown-guarded /search. Returns None (fast) while rate-limited
+    so callers fail over instead of cascading."""
+    global _last_search_ts, _search_cooldown_until
+    if time.time() < _search_cooldown_until:
+        return None
+    async with _search_lock:
+        if time.time() < _search_cooldown_until:
+            return None
+        gap = time.time() - _last_search_ts
+        if gap < _SEARCH_MIN_GAP:
+            await asyncio.sleep(_SEARCH_MIN_GAP - gap)
+        status, j = await _get_raw("/search", {"text": text, "types": "stock"})
+        _last_search_ts = time.time()
+        if status == 403:
+            _search_cooldown_until = time.time() + _SEARCH_COOLDOWN_S
+            log.warning("tickertape_search_rate_limited", cooldown_s=_SEARCH_COOLDOWN_S)
+            return None
+        return j
 
 
 async def resolve(symbol: str) -> dict[str, Any] | None:
-    """symbol → {sid, sector, name}. Cached for the process."""
+    """symbol → {sid, sector, name}. Seed → process cache → throttled /search."""
     symbol = symbol.strip().upper()
     if symbol in _sid_cache:
         return _sid_cache[symbol]
-    j = await _get("/search", {"text": symbol, "types": "stock"})
+    seed = _SID_SEED.get(symbol)
+    if seed:
+        rec = {"sid": seed, "sector": None, "name": None}
+        _sid_cache[symbol] = rec
+        return rec
+    j = await _search(symbol)
     stocks = ((j or {}).get("data") or {}).get("stocks") or []
     # Prefer exact ticker match.
     best = None
@@ -108,8 +159,6 @@ async def fetch_intraday_points(symbol: str, duration: str = "1d") -> list[dict[
         out.append({"timestamp": dt.isoformat(), "price": price, "volume": int(inc)})
     return out
 
-
-import asyncio  # noqa: E402
 
 # Tickertape accepts many sids per call; chunk to stay well under any URL/row cap.
 _BATCH_SIDS = 50
