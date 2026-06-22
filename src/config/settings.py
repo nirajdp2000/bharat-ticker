@@ -61,6 +61,20 @@ class Settings(BaseSettings):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 
+    # ── API auth ─────────────────────────────────────────────────────────
+    # Optional API-key gate. UNSET → auth DISABLED (open) so a deploy can't lock
+    # out a running service. Set API_KEY (single) or API_KEYS (comma list) to
+    # require an `X-API-Key` header or `?api_key=` on the data API.
+    api_key: str = ""
+    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def parse_api_keys(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            return [k.strip() for k in v.split(",") if k.strip()]
+        return v
+
     # ── Redis ────────────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
     redis_max_connections: int = 50

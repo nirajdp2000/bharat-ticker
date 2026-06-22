@@ -18,6 +18,9 @@ env/
 .env
 .env.local
 
+# Local migration artifacts (DB credentials + data dumps — never commit)
+_migration_backup/
+
 # IDE
 .idea/
 .vscode/
