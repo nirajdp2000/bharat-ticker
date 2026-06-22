@@ -28,6 +28,7 @@ from ...engine.live_candles import SAMPLE_INTERVAL_S, live_candle_engine
 from ...engine.watchlist_recorder import watchlist_recorder
 from ...engine.macro import fetch_fii_dii, fetch_macro
 from ...engine.market_data import market_data_service
+from ...providers.bse_master import bse_master
 from ...utils.ist_clock import is_market_open, now_ist
 from ...utils.logger import get_logger
 
@@ -490,12 +491,67 @@ async def _batch_quotes(syms: list[str], exchange: str = "NSE", rich: bool = Fal
     return by_sym
 
 
+# ── Session-open backfill (gap-fade needs `open`; Tickertape batch lacks it) ──
+# The real-NSE batch feed (Tickertape /stocks/quotes) returns price/high/low/
+# close/volume but NO `open` — superbrain's gap-fade engine REQUIRES the session
+# open (it synthesises today's bar from open/high/low). The session open is
+# IMMUTABLE once the 09:15 auction prints, so we fetch it ONCE per symbol per day
+# (Groww, which carries open + circuit/52wk/vwap) and cache it for the rest of the
+# session. First sweep of the day warms the cache; every later sweep is O(1).
+_SESSION_OPEN: dict[str, tuple[str, float]] = {}   # symbol → (yyyy-mm-dd, open)
+
+
+async def _fill_open(by_sym: dict[str, dict[str, Any]], exchange: str) -> None:
+    """Ensure each quote carries `open` (+ opportunistic circuit/52wk/vwap).
+
+    Best-effort: a symbol whose live fetch is slow/unavailable simply keeps no
+    `open` (same as before) — this never blocks or worsens the batch, only adds.
+    """
+    today = now_ist().date().isoformat()
+    need = [s for s, q in by_sym.items() if q.get("open") is None]
+    if not need:
+        return
+
+    fetch: list[str] = []
+    for s in need:
+        cached = _SESSION_OPEN.get(s)
+        if cached and cached[0] == today:
+            by_sym[s]["open"] = cached[1]
+        else:
+            fetch.append(s)
+    if not fetch:
+        return
+
+    sem = asyncio.Semaphore(_BULK_CONCURRENCY)
+
+    async def _one(s: str):
+        async with sem:
+            try:
+                return s, await _live_quote(s, exchange)
+            except Exception:  # noqa: BLE001
+                return s, None
+
+    for s, tick in await asyncio.gather(*(_one(s) for s in fetch)):
+        if not tick:
+            continue
+        o = _f(tick.open)
+        if o is not None:
+            by_sym[s]["open"] = o
+            _SESSION_OPEN[s] = (today, o)
+        # the Groww tick is richer than the Tickertape row — fill bonus fields too.
+        rich = _sb_quote(tick)
+        for k in ("upperCircuit", "lowerCircuit", "week52High", "week52Low", "vwap"):
+            if rich.get(k) is not None and by_sym[s].get(k) is None:
+                by_sym[s][k] = rich[k]
+
+
 @router.get("/quotes", summary="Bulk live quotes (real-NSE batch, no broker / no delayed)")
 async def sb_quotes(
     symbols: str = Query(..., description="Comma-separated symbols (max 200)"),
     exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     enrich: bool = Query(False, description="Fill companyName/sector (slower)"),
     rich: bool = Query(False, description="Force Groww fan-out (adds open/circuit/52wk/OI, slower)"),
+    fast: bool = Query(False, description="Skip the session-open backfill (price-only sweep, leanest)"),
 ):
     """Bulk quotes optimised for universe sweeps — **no broker API, no delayed
     data**.
@@ -511,6 +567,11 @@ async def sb_quotes(
         raise HTTPException(status_code=400, detail="No symbols")
 
     by_sym = await _batch_quotes(syms, exchange, rich)
+
+    # Backfill the session `open` (Tickertape batch omits it; gap-fade needs it).
+    # rich=true already carries open via the Groww fan-out; fast=true opts out.
+    if not rich and not fast:
+        await _fill_open(by_sym, exchange)
 
     # optional name/sector enrichment (resolve cache → cheap)
     if enrich:
@@ -1067,13 +1128,16 @@ async def sb_universe(
     rows = await market_data_service.get_all_snapshot(exchange.strip().upper())
     total = len(rows)
     page = rows[offset:offset + limit]
+    # The bhavcopy snapshot carries no ISIN — backfill from the in-memory BSE
+    # master (O(1) dict lookup, no HTTP) so the resolver returns a usable ISIN.
+    await bse_master.ensure_loaded()
     items = [{
         "symbol": r.get("symbol"),
         "name": r.get("name") or r.get("symbol"),
         "sector": r.get("sector"),
         "exchange": r.get("exchange", exchange.upper()),
         "series": r.get("series"),
-        "isin": r.get("isin"),
+        "isin": r.get("isin") or bse_master.isin_for(str(r.get("symbol") or "")),
     } for r in page]
     return {"exchange": exchange.upper(), "total": total, "count": len(items), "items": items}
 
@@ -1093,9 +1157,11 @@ async def sb_resolve(q: str = Query(..., min_length=1), exchange: str = Query("N
             break
     if not matches:
         raise HTTPException(status_code=404, detail=f"No instrument matching '{q}'")
+    await bse_master.ensure_loaded()   # ISIN backfill (snapshot has none)
     return {"query": q, "count": len(matches), "matches": [{
         "symbol": r.get("symbol"), "name": r.get("name") or r.get("symbol"),
-        "exchange": r.get("exchange", exchange.upper()), "isin": r.get("isin"),
+        "exchange": r.get("exchange", exchange.upper()),
+        "isin": r.get("isin") or bse_master.isin_for(str(r.get("symbol") or "")),
         "series": r.get("series"),
     } for r in matches[:20]]}
 
