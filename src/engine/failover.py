@@ -65,7 +65,8 @@ class FailoverController:
         return self._enabled.get(name, True)
 
     async def fetch_quote(
-        self, symbol: str, source: str | None = None, exclude_delayed: bool = False
+        self, symbol: str, source: str | None = None, exclude_delayed: bool = False,
+        exchange: str | None = None,
     ) -> TickData:
         """Fetch a quote, cascading through providers on failure.
 
@@ -74,6 +75,10 @@ class FailoverController:
         ``source`` ('nse' | 'bse' | 'yahoo' | provider name), or — when
         ``exclude_delayed`` — any delayed feed (Yahoo).  The latter enforces the
         rule that **live quotes only ever come from NSE/BSE, never Yahoo**.
+
+        ``exchange`` (when set) PINS the cascade to providers on that venue
+        (``provider.exchange``), so a caller that needs a single-venue series —
+        the live-candle sampler — never silently flips NSE↔BSE mid-stream (B2).
         Raises ProviderError if all candidates fail.
         """
         errors: list[str] = []
@@ -84,6 +89,8 @@ class FailoverController:
 
             # Skip if disabled or not matching the requested source
             if not self._enabled.get(provider.name, True):
+                continue
+            if exchange and provider.exchange != exchange:
                 continue
             if forced and not _source_match(provider, source):
                 continue

@@ -225,6 +225,35 @@ _OPTIONAL_QUOTE_FIELDS = (
 )
 
 
+def _freshness(asof_iso: str | None) -> dict[str, Any]:
+    """Honest data-age fields shared by EVERY quote shape (B1 fix).
+
+    ``asOf``      = upstream data timestamp when the feed provides one
+                    (Tickertape batch ``date``), else the fetch time (Groww
+                    relays no per-tick stamp, so fetch time is the best truth).
+    ``fetchedAt`` = server wall-clock when WE obtained it.
+    ``feedLagSec``= fetchedAt − asOf — how stale the upstream stamp is (0 when
+                    the feed carries no older stamp than fetch).
+
+    Lets a latency-sensitive consumer SEE staleness instead of trusting a single
+    timestamp that two code paths used to compute inconsistently (one stamped
+    ``now()`` and overstated freshness; the other echoed a ~60 s-old feed stamp).
+    """
+    now = now_ist()
+    out: dict[str, Any] = {"fetchedAt": now.isoformat()}
+    if asof_iso:
+        out["asOf"] = asof_iso
+        try:
+            t = datetime.fromisoformat(str(asof_iso).replace("Z", "+00:00"))
+            out["feedLagSec"] = round((now - t).total_seconds(), 1)
+        except (ValueError, TypeError):
+            pass
+    else:
+        out["asOf"] = now.isoformat()
+        out["feedLagSec"] = 0.0
+    return out
+
+
 def _sb_quote(tick) -> dict[str, Any]:
     """TickData → superbrain camelCase quote. Null rich fields are omitted."""
     meta = _META_CACHE.get(tick.symbol, {})
@@ -253,7 +282,8 @@ def _sb_quote(tick) -> dict[str, Any]:
         "source": tick.source,
         "dataQuality": quality,
         "live": quality == "REAL_TIME",
-        "asOf": now_ist().isoformat(),
+        "feedLatencyMs": round(getattr(tick, "source_latency_ms", 0.0) or 0.0, 1),
+        **_freshness(tick.timestamp.isoformat() if getattr(tick, "timestamp", None) else None),
     }
     # 52-week bounds must contain the live price + today's range. Upstream feeds
     # (Groww yearHigh/Low) can lag a fresh intraday extreme, otherwise reporting a
@@ -300,7 +330,7 @@ def _sb_quote_from_tt(symbol: str, row: dict[str, Any]) -> dict[str, Any]:
         "source": "tickertape_realtime_nse",
         "dataQuality": quality,
         "live": quality == "REAL_TIME",
-        "asOf": row.get("date") or now_ist().isoformat(),
+        **_freshness(row.get("date")),
     }
     if q["sector"] is None:
         q.pop("sector", None)
@@ -355,18 +385,51 @@ def _norm_candles(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-async def _live_quote(symbol: str, exchange: str):
-    """Live (NSE/BSE) quote when open; allow EOD/last-close when shut."""
+# ── Live-quote single-flight micro-cache (B3) ───────────────────────────────
+# A burst of concurrent requests for the SAME symbol (universe sweep, many SSE
+# openers, retry storms) must NOT fan out to N upstream fetches — on a single
+# process that saturates the host and serialises every caller (observed: one
+# request stalled 110 s under load). Collapse them: the first caller starts ONE
+# fetch task, concurrent callers await the same task, and the result is briefly
+# cached so duplicate hits are sub-millisecond. TTL is short enough that a
+# low-latency consumer still sees fresh ticks; the SSE stream stays uncached.
+_LIVE_Q_TTL_S = float(os.environ.get("SB_LIVE_QUOTE_TTL_S", "1.0"))
+_live_q_cache: dict[str, tuple[float, Any]] = {}
+_live_q_inflight: dict[str, "asyncio.Future"] = {}
+
+
+async def _do_live_fetch(symbol: str, exchange: str, key: str):
     tick = await market_data_service.get_quote_through(symbol, exchange, exclude_delayed=True)
     if not tick and not is_market_open():
         tick = await market_data_service.get_quote_through(symbol, exchange)
     if tick:
-        # feed the live-candle sampler for free
+        # feed the live-candle sampler for free — only with a SAME-venue tick
+        # (tagged by source) so the sampler's volume series stays single-source (B2).
         try:
-            live_candle_engine.record(symbol, exchange, tick.ltp, tick.volume)
+            if tick.exchange == exchange.upper():
+                live_candle_engine.record(symbol, exchange, tick.ltp, tick.volume, source=tick.source)
         except Exception:  # noqa: BLE001
             pass
+        _live_q_cache[key] = (time.time(), tick)
     return tick
+
+
+async def _live_quote(symbol: str, exchange: str):
+    """Live (NSE/BSE) quote when open; allow EOD/last-close when shut.
+
+    Single-flight + short TTL (B3): concurrent duplicate-symbol reads share ONE
+    upstream fetch instead of hammering the host.
+    """
+    key = f"{exchange.upper()}:{symbol.upper()}"
+    hit = _live_q_cache.get(key)
+    if hit and time.time() - hit[0] < _LIVE_Q_TTL_S:
+        return hit[1]
+    task = _live_q_inflight.get(key)
+    if task is None:
+        task = asyncio.ensure_future(_do_live_fetch(symbol, exchange, key))
+        _live_q_inflight[key] = task
+        task.add_done_callback(lambda t: _live_q_inflight.pop(key, None))
+    return await task
 
 
 # ── Quotes ────────────────────────────────────────────────────────────────────
@@ -374,7 +437,7 @@ async def _live_quote(symbol: str, exchange: str):
 @router.get("/quote/{symbol}", summary="Live quote (superbrain shape)")
 async def sb_quote(
     symbol: str,
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     enrich: bool = Query(True, description="Fill companyName/sector"),
 ):
     original = (symbol or "").strip().upper()
@@ -430,7 +493,7 @@ async def _batch_quotes(syms: list[str], exchange: str = "NSE", rich: bool = Fal
 @router.get("/quotes", summary="Bulk live quotes (real-NSE batch, no broker / no delayed)")
 async def sb_quotes(
     symbols: str = Query(..., description="Comma-separated symbols (max 200)"),
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     enrich: bool = Query(False, description="Fill companyName/sector (slower)"),
     rich: bool = Query(False, description="Force Groww fan-out (adds open/circuit/52wk/OI, slower)"),
 ):
@@ -490,7 +553,7 @@ async def _today_bar_from_quote(symbol: str, exchange: str) -> dict[str, Any] | 
 @router.get("/candles/{symbol}", summary="Daily candles (numeric, CA-adjusted, live today-bar)")
 async def sb_candles(
     symbol: str,
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     range: str = Query("6mo"),
     interval: str = Query("1d"),
     adjust: bool = Query(True, description="Back-adjust splits/bonus"),
@@ -528,7 +591,7 @@ async def sb_candles(
 @router.get("/intraday/{symbol}", summary="Real-time intraday candles (BSE live + 1s/10s tick)")
 async def sb_intraday(
     symbol: str,
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     interval: str = Query("30minute"),
     limit: int | None = Query(None, ge=1, le=100000, description="Max bars to return; OMIT for ALL data (no truncation)"),
     date: str | None = Query(None, description="YYYY-MM-DD — past-day sub-minute (1s/10s) pull from the durable store"),
@@ -651,7 +714,13 @@ async def sb_intervals():
             "source": "live_tick_aggregation (NSE/BSE feed sampled, never delayed)",
             "finestSeconds": min(_SECONDS_INTERVALS.values()),
             "samplerCadenceSeconds": SAMPLE_INTERVAL_S,
-            "note": "bucket resolution is bounded by the sampler cadence",
+            "note": (
+                "Sub-second buckets are BEST-EFFORT: each sample is a live "
+                "upstream fetch, so effective cadence = max(fetch_latency, "
+                f"{SAMPLE_INTERVAL_S}s) — typically ~1-2s on a public feed, not "
+                "true 250ms. See /sb/diagnostics or stream 'source' for the "
+                "measured rate. Genuine tick-level needs a broker WebSocket."
+            ),
         },
         "minutesAndHours": {
             "intervals": sorted(set(INTRADAY_SECONDS)),
@@ -707,7 +776,7 @@ async def sb_cache_clear():
 @router.get("/stream/{symbol}", summary="Live tick stream (SSE, minimum latency, no broker)")
 async def sb_stream(
     symbol: str,
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     maxSeconds: int = Query(300, ge=5, le=3600, description="Auto-close after N seconds"),
 ):
     """Server-Sent-Events tick stream — pushes each new sampled tick the instant
@@ -782,7 +851,7 @@ async def _today_session_bars(
 @router.get("/history/{symbol}", summary="Dated candles (day/30minute, +oi, CA-adjusted)")
 async def sb_history(
     symbol: str,
-    exchange: str = Query("NSE", regex="^(NSE|BSE)$"),
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     interval: str = Query("day"),
     from_: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
     to: str | None = Query(None, description="YYYY-MM-DD"),
@@ -1034,7 +1103,7 @@ async def sb_resolve(q: str = Query(..., min_length=1), exchange: str = Query("N
 # ── Data-availability diagnostics ───────────────────────────────────────────────
 
 @router.get("/diagnostics/{symbol}", summary="Probe every source; report null/stale data")
-async def sb_diagnostics(symbol: str, exchange: str = Query("NSE", regex="^(NSE|BSE)$")):
+async def sb_diagnostics(symbol: str, exchange: str = Query("NSE", pattern="^(NSE|BSE)$")):
     """Per-source availability matrix for a symbol — surfaces null/incorrect data.
 
     Probes the real feeds (live quote, BSE intraday, daily history, fundamentals,

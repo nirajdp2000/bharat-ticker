@@ -57,8 +57,15 @@ class LiveCandleEngine:
     def _key(symbol: str, exchange: str) -> str:
         return f"{exchange.upper()}:{symbol.upper()}"
 
-    def record(self, symbol: str, exchange: str, price: Any, cum_volume: Any, ts: float | None = None) -> None:
-        """Push one live sample. Ignores non-positive prices."""
+    def record(self, symbol: str, exchange: str, price: Any, cum_volume: Any,
+               ts: float | None = None, source: str | None = None) -> None:
+        """Push one live sample. Ignores non-positive prices.
+
+        ``source`` tags the venue/provider so the volume-delta in :meth:`build`
+        is only taken between SAME-source samples — a cross-exchange flip
+        (NSE↔BSE) carries a different cumulative volume and would otherwise
+        inject a spurious spike or a backward jump (B2 fix).
+        """
         try:
             p = float(price)
         except (TypeError, ValueError):
@@ -69,7 +76,7 @@ class LiveCandleEngine:
             v = float(cum_volume or 0)
         except (TypeError, ValueError):
             v = 0.0
-        self._samples[self._key(symbol, exchange)].append((ts or time.time(), p, v))
+        self._samples[self._key(symbol, exchange)].append((ts or time.time(), p, v, source))
 
     async def ensure_recorder(self, symbol: str, exchange: str = "NSE") -> None:
         """Start (or keep alive) the background sampler for this symbol."""
@@ -86,13 +93,13 @@ class LiveCandleEngine:
         from .market_data import market_data_service
         try:
             tick = await market_data_service.get_quote_through(
-                symbol, exchange, exclude_delayed=True, write_cache=False
+                symbol, exchange, exclude_delayed=True, write_cache=False, pin_exchange=True
             )
         except Exception as e:  # noqa: BLE001
             log.debug("live_candle_sample_once_failed", symbol=symbol, error=str(e))
             return False
         if tick:
-            self.record(symbol, exchange, tick.ltp, tick.volume)
+            self.record(symbol, exchange, tick.ltp, tick.volume, source=tick.source)
             return True
         return False
 
@@ -104,12 +111,15 @@ class LiveCandleEngine:
             while True:
                 if time.time() - self._last_read.get(key, 0) > IDLE_TTL_S:
                     break
+                loop_t0 = time.time()
                 try:
+                    # pin_exchange=True keeps every sample on ONE venue so the
+                    # cumulative-volume series stays single-source (B2).
                     tick = await market_data_service.get_quote_through(
-                        symbol, exchange, exclude_delayed=True, write_cache=False
+                        symbol, exchange, exclude_delayed=True, write_cache=False, pin_exchange=True
                     )
                     if tick:
-                        self.record(symbol, exchange, tick.ltp, tick.volume)
+                        self.record(symbol, exchange, tick.ltp, tick.volume, source=tick.source)
                 except Exception as e:  # noqa: BLE001
                     log.debug("live_candle_sample_failed", symbol=symbol, error=str(e))
                 # Periodically persist 1s candles so PAST days survive a restart /
@@ -121,7 +131,10 @@ class LiveCandleEngine:
                         await flush_live_to_store(symbol, exchange)
                     except Exception as e:  # noqa: BLE001
                         log.debug("live_candle_flush_failed", symbol=symbol, error=str(e))
-                await asyncio.sleep(SAMPLE_INTERVAL_S)
+                # Non-additive cadence (B6): the per-sample upstream fetch already
+                # consumes wall-clock — sleep only the REMAINDER so the loop period
+                # is max(fetch, SAMPLE_INTERVAL_S), not fetch + SAMPLE_INTERVAL_S.
+                await asyncio.sleep(max(0.0, SAMPLE_INTERVAL_S - (time.time() - loop_t0)))
         finally:
             # Final flush on stop so the tail of the session is durable.
             try:
@@ -147,7 +160,8 @@ class LiveCandleEngine:
         buckets: dict[int, dict[str, Any]] = {}
         order: list[int] = []
         prev_cum: float | None = None
-        for ts, price, cum in samples:
+        prev_src: str | None = None
+        for ts, price, cum, src in samples:
             idx = math.floor(ts / seconds)        # int bucket index (fractional-safe)
             cell = buckets.get(idx)
             if cell is None:
@@ -157,9 +171,13 @@ class LiveCandleEngine:
             cell["h"] = max(cell["h"], price)
             cell["l"] = min(cell["l"], price)
             cell["c"] = price
-            if prev_cum is not None and cum >= prev_cum:
+            # Volume delta ONLY between same-source samples (B2): a venue/provider
+            # flip carries an unrelated cumulative total — counting that delta
+            # would fabricate volume. Re-baseline silently on a source change.
+            if prev_cum is not None and src == prev_src and cum >= prev_cum:
                 cell["v"] += (cum - prev_cum)
             prev_cum = cum
+            prev_src = src
 
         sub_second = seconds < 1
         out: list[dict[str, Any]] = []
@@ -182,17 +200,31 @@ class LiveCandleEngine:
         dq = self._samples.get(key)
         if not dq:
             return None
-        ts, price, cum = dq[-1]
+        ts, price, cum, src = dq[-1]
         return {
             "timestamp": datetime.fromtimestamp(ts, tz=IST).isoformat(timespec="milliseconds"),
-            "epoch": ts, "price": round(price, 2), "cumVolume": int(cum),
+            "epoch": ts, "price": round(price, 2), "cumVolume": int(cum), "source": src,
         }
+
+    def measured_cadence_s(self, symbol: str, exchange: str = "NSE") -> float | None:
+        """Median inter-sample gap over the recent tail — the TRUE achievable
+        resolution (bounded by upstream fetch latency), not the configured
+        target. Lets callers see real frequency instead of an aspirational one (B6).
+        """
+        dq = self._samples.get(self._key(symbol, exchange))
+        if not dq or len(dq) < 3:
+            return None
+        tail = list(dq)[-20:]
+        gaps = sorted(tail[i + 1][0] - tail[i][0] for i in range(len(tail) - 1))
+        return round(gaps[len(gaps) // 2], 2) if gaps else None
 
     def status(self, symbol: str, exchange: str = "NSE") -> dict[str, Any]:
         key = self._key(symbol, exchange)
         return {
             "recording": bool(self._tasks.get(key) and not self._tasks[key].done()),
             "samples": len(self._samples.get(key, ())),
+            "samplerTargetSeconds": SAMPLE_INTERVAL_S,
+            "measuredCadenceSeconds": self.measured_cadence_s(symbol, exchange),
             "market_open": is_market_open(),
         }
 
