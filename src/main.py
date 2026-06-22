@@ -54,6 +54,12 @@ async def lifespan(app: FastAPI):
     from .engine.market_data import market_data_service
     asyncio.create_task(market_data_service.warm())
 
+    # Self-heal watchdog: if the event loop ever wedges (overload/deadlock — the
+    # "up but unresponsive" state), force-exit so the host restarts a fresh
+    # container automatically. No external trigger/credentials needed.
+    from .utils.watchdog import start_event_loop_watchdog
+    start_event_loop_watchdog(asyncio.get_running_loop())
+
     # Always-on watchlist recorder — gap-free same-day 1s capture + durable flush.
     # Dormant unless WATCHLIST env is set (no surprise upstream load otherwise).
     from .engine.watchlist_recorder import watchlist_recorder
