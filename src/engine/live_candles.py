@@ -40,6 +40,9 @@ SAMPLE_INTERVAL_S = max(0.1, float(os.environ.get("LIVE_SAMPLE_INTERVAL_S", "0.5
 # store holds past days. Override LIVE_SAMPLE_MAXLEN only to fit a tiny host.
 SAMPLE_MAXLEN = int(os.environ.get("LIVE_SAMPLE_MAXLEN", "46000"))
 IDLE_TTL_S = 120            # stop a recorder after 2 min with no reads
+# A symbol's sample stream is owned by ONE source; a 2nd source only takes over
+# after the owner has been silent this long (B2 single-source rule).
+PRIMARY_SOURCE_TTL_S = float(os.environ.get("LIVE_PRIMARY_TTL_S", "5"))
 STORE_FLUSH_INTERVAL_S = float(os.environ.get("STORE_FLUSH_INTERVAL_S", "30"))  # 1s-candle → DB flush
 
 
@@ -47,10 +50,19 @@ class LiveCandleEngine:
     """Samples live LTP and serves 1s / 10s OHLCV candles on demand."""
 
     def __init__(self) -> None:
-        # key -> deque[(epoch_seconds, price, cumulative_volume)]
+        # key -> deque[(epoch_seconds, price, cumulative_volume, source)]
         self._samples: dict[str, deque] = defaultdict(lambda: deque(maxlen=SAMPLE_MAXLEN))
         self._tasks: dict[str, asyncio.Task] = {}
         self._last_read: dict[str, float] = {}
+        # Single-source rule (B2): a symbol can be fed by >1 recorder at once (the
+        # on-demand sampler AND the always-on watchlist recorder use DIFFERENT
+        # feeds — Groww vs Tickertape). Both are NSE, but interleaving their two
+        # cumulative-volume series makes the tape jump backward AND would let
+        # build() count both feeds' deltas (volume DOUBLED). So one source owns a
+        # key at a time; a second source is dropped while the owner stays fresh,
+        # and only takes over after the owner goes quiet (PRIMARY_TTL).
+        self._primary_src: dict[str, str] = {}
+        self._primary_ts: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -65,6 +77,12 @@ class LiveCandleEngine:
         is only taken between SAME-source samples — a cross-exchange flip
         (NSE↔BSE) carries a different cumulative volume and would otherwise
         inject a spurious spike or a backward jump (B2 fix).
+
+        Single-source rule (B2): one source owns the key at a time. A different
+        source is DROPPED while the owner is still fresh, so two concurrent
+        recorders (Groww on-demand + Tickertape watchlist) can't interleave two
+        cumulative-volume series (backward tape / doubled bucket volume). After
+        the owner goes quiet for ``PRIMARY_SOURCE_TTL_S`` a new source takes over.
         """
         try:
             p = float(price)
@@ -76,7 +94,16 @@ class LiveCandleEngine:
             v = float(cum_volume or 0)
         except (TypeError, ValueError):
             v = 0.0
-        self._samples[self._key(symbol, exchange)].append((ts or time.time(), p, v, source))
+        key = self._key(symbol, exchange)
+        now_ts = ts if ts is not None else time.time()
+        if source is not None:
+            owner = self._primary_src.get(key)
+            owner_fresh = (now_ts - self._primary_ts.get(key, 0.0)) <= PRIMARY_SOURCE_TTL_S
+            if owner is not None and owner != source and owner_fresh:
+                return  # secondary source while the owner is live — drop it
+            self._primary_src[key] = source
+            self._primary_ts[key] = now_ts
+        self._samples[key].append((now_ts, p, v, source))
 
     async def ensure_recorder(self, symbol: str, exchange: str = "NSE") -> None:
         """Start (or keep alive) the background sampler for this symbol."""

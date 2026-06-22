@@ -84,21 +84,30 @@ else:
 
 
 # ── B2: cross-source volume contamination is impossible ──────────────────────
-print("\n== B2. same-source volume delta only ==")
+print("\n== B2. single-source rule (no interleave / no double-count) ==")
 e = LiveCandleEngine()
-# groww 1000→1010 (+10), FLIP to bse 2950 (higher cum — old bug added +1940), bse→2960 (+10)
+# groww owns the key; a 2nd source (bse) arriving while groww is fresh is DROPPED
+# — so its cumulative series can't interleave or double the bucket volume.
 for ts, px, cum, s in [(0.0, 100, 1000, "groww"), (0.1, 101, 1010, "groww"),
                        (0.2, 99, 2950, "bse"), (0.3, 99, 2960, "bse")]:
     e.record("X", "NSE", px, cum, ts=ts, source=s)
 vol = sum(b["volume"] for b in e.build("X", "NSE", seconds=3600))
-ok(vol == 20, "cross-source flip does NOT fabricate volume", f"got {vol}, want 20 (10+10)")
+ok(vol == 10, "secondary source dropped while owner fresh (no double-count)", f"got {vol}, want 10")
+ok(e.latest_tick("X", "NSE").get("source") == "groww", "owner source holds the tape")
 # pure same-source still accumulates correctly
 e2 = LiveCandleEngine()
 for ts, cum in [(0.0, 1000), (0.1, 1010), (0.2, 1025)]:
     e2.record("Y", "NSE", 100, cum, ts=ts, source="groww")
 v2 = sum(b["volume"] for b in e2.build("Y", "NSE", seconds=3600))
 ok(v2 == 25, "same-source delta intact (no over-suppression)", f"got {v2}, want 25")
-ok(e.latest_tick("X", "NSE").get("source") == "bse", "latest_tick exposes source")
+ok(e.latest_tick("X", "NSE").get("source") == "groww", "latest_tick exposes source")
+# stale owner → a new source legitimately takes over
+e4 = LiveCandleEngine()
+e4.record("W", "NSE", 100, 1000, ts=0.0, source="groww")
+e4.record("W", "NSE", 100, 9999, ts=2.0, source="tickertape")   # 2s < TTL → dropped
+ok(len(list(e4._samples["NSE:W"])) == 1, "owner holds within TTL")
+e4.record("W", "NSE", 100, 500, ts=10.0, source="tickertape")   # >TTL idle → takeover
+ok(e4.latest_tick("W", "NSE")["source"] == "tickertape", "stale owner → new source takes over")
 
 # pin: failover confined to one venue
 print("\n== B2. failover exchange-pin ==")
