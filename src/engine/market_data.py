@@ -111,6 +111,7 @@ class MarketDataService:
     async def get_quote_through(
         self, symbol: str, exchange: str = "NSE", source: str | None = None,
         write_cache: bool = True, exclude_delayed: bool = False,
+        pin_exchange: bool = False,
     ) -> TickData | None:
         """Fetch a live quote on demand and (optionally) write it to the cache.
 
@@ -118,11 +119,17 @@ class MarketDataService:
         providers are used — drives the UI source-toggle buttons.  Forced-source
         reads pass ``write_cache=False`` so an explicit override doesn't pollute
         the shared default (auto) cache entry.
+
+        ``pin_exchange`` confines the cascade to ``exchange``-venue providers so
+        a single-venue consumer (live-candle sampler) never flips NSE↔BSE (B2).
         """
         symbol = canonical_symbol(symbol)
         fc = await self._controller()
         try:
-            tick = await fc.fetch_quote(symbol, source=source, exclude_delayed=exclude_delayed)
+            tick = await fc.fetch_quote(
+                symbol, source=source, exclude_delayed=exclude_delayed,
+                exchange=(exchange if pin_exchange else None),
+            )
         except Exception as e:
             log.warning("fetch_through_failed", symbol=symbol, source=source, error=str(e))
             return None

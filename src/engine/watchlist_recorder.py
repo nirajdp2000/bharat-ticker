@@ -84,7 +84,8 @@ class WatchlistRecorder:
                 for sym, row in quotes.items():
                     price = row.get("price")
                     if price:
-                        live_candle_engine.record(sym, "NSE", price, row.get("volume") or 0, ts=now)
+                        live_candle_engine.record(sym, "NSE", price, row.get("volume") or 0,
+                                                  ts=now, source="tickertape_realtime_nse")
                 self._ticks += 1
                 self._last_tick = now
 
