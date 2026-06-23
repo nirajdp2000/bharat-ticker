@@ -66,6 +66,12 @@ async def lifespan(app: FastAPI):
     if watchlist_recorder.enabled:
         await watchlist_recorder.start()
 
+    # Hot-universe warm-cache loop (#7): background-refresh a fixed hot set so
+    # universe sweeps hit warm memory instead of re-scraping each poll. Dormant
+    # unless SB_WARM_SYMBOLS is set or a watchlist is active.
+    from .api.endpoints.superbrain import start_warm_cache
+    start_warm_cache()
+
     # Daily retention prune (replaces TimescaleDB's auto-policy on vanilla PG so
     # the 1s store can't fill the disk). No-op until a DB is connected.
     from .engine.intraday_store import start_prune_scheduler

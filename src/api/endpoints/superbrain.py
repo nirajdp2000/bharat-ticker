@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
 from ...engine import chartink, tickertape
@@ -433,6 +433,106 @@ async def _live_quote(symbol: str, exchange: str):
     return await task
 
 
+# ── Edge cache-control (#5) ──────────────────────────────────────────────────
+# A tiny, freshness-bounded Cache-Control lets an edge/CDN in front of the origin
+# (Cloudflare) micro-cache market data WITHIN the feed-lag window — without this
+# header a CDN won't cache a dynamic API response at all, so every request still
+# crosses the ocean to the origin. ``max-age`` stays ≤ the live feed lag and
+# ``stale-while-revalidate`` lets the edge serve last-good instantly while it
+# refreshes behind the scenes (the same SWR contract the client uses). Each quote
+# still carries asOf/feedLagSec so staleness is always visible to the consumer.
+def _set_edge_cache(response: Response, *, open_max_age: int = 2, open_swr: int = 8,
+                    closed_max_age: int = 30, closed_swr: int = 120) -> None:
+    if is_market_open():
+        response.headers["Cache-Control"] = (
+            f"public, max-age={open_max_age}, stale-while-revalidate={open_swr}")
+    else:
+        response.headers["Cache-Control"] = (
+            f"public, max-age={closed_max_age}, stale-while-revalidate={closed_swr}")
+
+
+# ── Hot-universe warm cache (#7) ─────────────────────────────────────────────
+# A background loop batch-refreshes a fixed HOT universe (F&O + the active
+# watchlist) every few seconds during market hours and parks the camelCase quotes
+# in-process, so a universe sweep asking for those symbols hits warm memory (~5ms)
+# instead of re-scraping (~370ms upstream) on EVERY poll. Opt-in: dormant unless
+# SB_WARM_SYMBOLS is set or a watchlist is active (no surprise upstream load),
+# market-hours only (free-tier compute budget), and the served TTL is bounded
+# ≤ ~2× the refresh interval so a warm quote never outlives its freshness window.
+_WARM_SYMBOLS = [s.strip().upper() for s in os.environ.get("SB_WARM_SYMBOLS", "").split(",") if s.strip()]
+_WARM_INTERVAL_S = max(2.0, float(os.environ.get("SB_WARM_INTERVAL_S", "5")))
+_WARM_TTL_S = max(_WARM_INTERVAL_S, float(os.environ.get("SB_WARM_TTL_S", str(_WARM_INTERVAL_S * 2))))
+_WARM_FAST = os.environ.get("SB_WARM_FAST", "true").lower() in ("1", "true", "yes")
+_warm_cache: dict[str, tuple[float, dict[str, Any]]] = {}   # symbol → (ts, sb_quote)
+_warm_task: "asyncio.Task | None" = None
+_warm_stats: dict[str, Any] = {"refreshes": 0, "lastRefreshS": None, "lastCount": 0, "lastMs": None}
+
+
+def _warm_symbols() -> list[str]:
+    """Hot universe = configured SB_WARM_SYMBOLS ∪ the active watchlist set."""
+    syms = list(_WARM_SYMBOLS)
+    try:
+        for s in watchlist_recorder.status().get("watchlist", []) or []:
+            if s not in syms:
+                syms.append(s)
+    except Exception:  # noqa: BLE001
+        pass
+    return [_canon(s) for s in syms][:200]
+
+
+def _warm_get(symbol: str, rich: bool, fast: bool) -> dict[str, Any] | None:
+    """Warm quote if fresh enough AND it satisfies the request shape."""
+    hit = _warm_cache.get(symbol)
+    if not hit or (time.time() - hit[0]) >= _WARM_TTL_S:
+        return None
+    q = hit[1]
+    if rich:
+        return None                      # rich wants Groww-only fields the warm sweep may lack
+    if not fast and q.get("open") is None:
+        return None                      # caller needs session open; warm entry lacks it
+    return q
+
+
+async def _warm_refresh_once(symbols: list[str]) -> None:
+    t0 = time.time()
+    by = await _batch_quotes(symbols, "NSE", rich=False)
+    if not _WARM_FAST:
+        await _fill_open(by, "NSE")
+    now = time.time()
+    for s, q in by.items():
+        _warm_cache[s] = (now, q)
+    _warm_stats["refreshes"] += 1
+    _warm_stats["lastRefreshS"] = now
+    _warm_stats["lastCount"] = len(by)
+    _warm_stats["lastMs"] = round((now - t0) * 1000, 1)
+
+
+async def _warm_loop() -> None:
+    log.info("sb_warm_cache_start", symbols=len(_warm_symbols()),
+             interval_s=_WARM_INTERVAL_S, fast=_WARM_FAST)
+    while True:
+        try:
+            if not is_market_open():
+                await asyncio.sleep(30)        # idle off-session
+                continue
+            syms = _warm_symbols()
+            if syms:
+                await _warm_refresh_once(syms)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("sb_warm_refresh_failed", error=str(e)[:140])
+        await asyncio.sleep(_WARM_INTERVAL_S)
+
+
+def start_warm_cache() -> None:
+    """Launch the warm-cache loop if a hot universe is configured. Idempotent."""
+    global _warm_task
+    if _warm_task is not None or not _warm_symbols():
+        return
+    _warm_task = asyncio.ensure_future(_warm_loop())
+
+
 # ── Quotes ────────────────────────────────────────────────────────────────────
 
 @router.get("/quote/{symbol}", summary="Live quote (superbrain shape)")
@@ -547,11 +647,13 @@ async def _fill_open(by_sym: dict[str, dict[str, Any]], exchange: str) -> None:
 
 @router.get("/quotes", summary="Bulk live quotes (real-NSE batch, no broker / no delayed)")
 async def sb_quotes(
+    response: Response,
     symbols: str = Query(..., description="Comma-separated symbols (max 200)"),
     exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     enrich: bool = Query(False, description="Fill companyName/sector (slower)"),
     rich: bool = Query(False, description="Force Groww fan-out (adds open/circuit/52wk/OI, slower)"),
     fast: bool = Query(False, description="Skip the session-open backfill (price-only sweep, leanest)"),
+    fields: str = Query("", description="Comma list to project each quote down to (smaller payload); 'symbol' always kept"),
 ):
     """Bulk quotes optimised for universe sweeps — **no broker API, no delayed
     data**.
@@ -566,10 +668,25 @@ async def sb_quotes(
     if not syms:
         raise HTTPException(status_code=400, detail="No symbols")
 
-    by_sym = await _batch_quotes(syms, exchange, rich)
+    # Warm-cache fast path (#7): symbols kept hot by the background refresh are
+    # served from memory; only the rest hit the upstream batch. Skipped when
+    # enrich=True (a warm entry may lack name/sector) so behaviour is unchanged.
+    by_sym: dict[str, dict[str, Any]] = {}
+    fetch_syms = syms
+    if not enrich and not rich:
+        for s in syms:
+            wq = _warm_get(s, rich, fast)
+            if wq is not None:
+                by_sym[s] = wq
+        if by_sym:
+            fetch_syms = [s for s in syms if s not in by_sym]
+
+    if fetch_syms:
+        by_sym.update(await _batch_quotes(fetch_syms, exchange, rich))
 
     # Backfill the session `open` (Tickertape batch omits it; gap-fade needs it).
     # rich=true already carries open via the Groww fan-out; fast=true opts out.
+    # No-op for warm entries that already carry open (filtered inside _fill_open).
     if not rich and not fast:
         await _fill_open(by_sym, exchange)
 
@@ -588,6 +705,16 @@ async def sb_quotes(
     sources: dict[str, int] = {}
     for q in out:
         sources[q["source"]] = sources.get(q["source"], 0) + 1
+
+    # Field projection (#8): shrink the wire payload to only the keys the consumer
+    # asked for (e.g. ?fields=price,open,changePct). `symbol` is always kept so the
+    # response stays addressable. Source counts are computed BEFORE projection so
+    # the meta stays accurate even when `source` is projected out.
+    if fields:
+        keep = {f.strip() for f in fields.split(",") if f.strip()} | {"symbol"}
+        out = [{k: v for k, v in q.items() if k in keep} for q in out]
+
+    _set_edge_cache(response)
     return {"count": len(out), "failed": failed, "sources": sources, "quotes": out}
 
 
@@ -614,6 +741,7 @@ async def _today_bar_from_quote(symbol: str, exchange: str) -> dict[str, Any] | 
 @router.get("/candles/{symbol}", summary="Daily candles (numeric, CA-adjusted, live today-bar)")
 async def sb_candles(
     symbol: str,
+    response: Response,
     exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
     range: str = Query("6mo"),
     interval: str = Query("1d"),
@@ -642,6 +770,7 @@ async def sb_candles(
                 candles.append({k: tb[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
             live_overlay = True
 
+    _set_edge_cache(response)
     return {
         "symbol": symbol, "exchange": exchange, "interval": code, "range": range,
         "count": len(candles), "adjusted": bool(events), "splitEvents": events,
@@ -826,6 +955,29 @@ async def sb_prune(
 async def sb_cache_stats():
     """Size (entries + approx MB) + TTLs of the past/today candle caches."""
     return {"past": _HIST_CACHE.stats(), "today": _TODAY_CACHE.stats()}
+
+
+@router.get("/warm", summary="Hot-universe warm-cache status (#7)")
+async def sb_warm_status():
+    """State of the background hot-universe refresh: configured symbols, cadence,
+    served-TTL, last refresh latency, and how many quotes are currently warm."""
+    syms = _warm_symbols()
+    last = _warm_stats["lastRefreshS"]
+    return {
+        "enabled": bool(syms),
+        "running": _warm_task is not None and not _warm_task.done(),
+        "symbols": syms,
+        "count": len(syms),
+        "intervalSeconds": _WARM_INTERVAL_S,
+        "ttlSeconds": _WARM_TTL_S,
+        "fast": _WARM_FAST,
+        "cachedQuotes": len(_warm_cache),
+        "marketOpen": is_market_open(),
+        "refreshes": _warm_stats["refreshes"],
+        "lastCount": _warm_stats["lastCount"],
+        "lastRefreshMs": _warm_stats["lastMs"],
+        "lastRefreshAgeS": round(time.time() - last, 1) if last else None,
+    }
 
 
 @router.post("/cache/clear", summary="Clear the intraday history cache")
